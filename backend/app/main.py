@@ -2,12 +2,27 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from loguru import logger
+from sqlalchemy import text
 
 from app.core.config import get_settings
 from app.core.database import engine, Base
 from app.api import auth_router, chat_router, ws_router, memory_router, tasks_router, skills_router, llm_router
 
 settings = get_settings()
+
+
+async def _run_migrations(conn):
+    """Add new columns if they don't exist (idempotent)."""
+    migrations = [
+        "ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS provider_id VARCHAR(64)",
+        "ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS tools_enabled BOOLEAN DEFAULT TRUE",
+    ]
+    for sql in migrations:
+        try:
+            await conn.execute(text(sql))
+            logger.info(f"Migration OK: {sql[:60]}...")
+        except Exception as e:
+            logger.warning(f"Migration skipped: {e}")
 
 
 @asynccontextmanager
@@ -19,6 +34,10 @@ async def lifespan(app: FastAPI):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     
+    # Run migrations for new columns (PostgreSQL)
+    async with engine.begin() as conn:
+        await _run_migrations(conn)
+
     logger.info("Database tables created")
     yield
     

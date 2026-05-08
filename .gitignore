@@ -12,3 +12,7 @@ venv/
 node_modules/
 *.log
 .DS_Store
+
+# Claude CLI binary (240MB, too large for git)
+backend/bin/claude.exe
+bin/

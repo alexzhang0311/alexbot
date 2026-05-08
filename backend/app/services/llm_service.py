@@ -75,7 +75,9 @@ class LLMService:
         Send chat request to LLM provider.
         Yields response chunks for streaming.
         """
-        provider = await self._get_provider(provider_id, user_id)
+        # provider_id from kwargs takes priority over the parameter
+        _pid = kwargs.pop("provider_id", None) or provider_id
+        provider = await self._get_provider(_pid, user_id)
         if not provider:
             yield "⚠️ 未配置 LLM Provider，请先在设置中配置。"
             return
@@ -103,42 +105,97 @@ class LLMService:
         stream: bool = True,
         **kwargs
     ) -> AsyncGenerator[str, None]:
-        """Call Claude Agent SDK (supports custom base_url + MiniMax proxy)"""
+        """Call Claude Agent SDK with tool support (skills, bash, file ops)"""
         from claude_agent_sdk import query, ClaudeAgentOptions
         import os
 
+        # Split system prompt from conversation messages
         system_prompt = ""
-        filtered_messages = []
+        conversation = []
         for msg in messages:
             if msg["role"] == "system":
                 system_prompt = msg["content"]
             else:
-                filtered_messages.append(msg)
+                conversation.append(msg)
 
+        # Build env with provider credentials
         env = dict(os.environ)
         if provider.api_key:
             env["ANTHROPIC_API_KEY"] = provider.api_key
         if provider.base_url:
             env["ANTHROPIC_BASE_URL"] = provider.base_url.rstrip("/")
 
+        # Get tools config from provider config or use defaults
+        provider_config = provider.config or {}
+        tools_enabled = kwargs.get("tools_enabled", provider_config.get("tools_enabled", True))
+
+        if tools_enabled:
+            allowed_tools = provider_config.get("allowed_tools", [
+                "Read", "Write", "Edit", "Bash", "Glob", "Grep",
+            ])
+        else:
+            allowed_tools = []
+
+        # Capture stderr for better error diagnostics
+        stderr_lines = []
+        def _stderr_cb(line: str):
+            stderr_lines.append(line)
+
         options = ClaudeAgentOptions(
             model=model,
-            allowed_tools=[],  # No tools, pure text generation
+            allowed_tools=allowed_tools,
+            skills=["weather", "calculator", "reminder", "qa"],
+            permission_mode="bypassPermissions",
             env=env,
             include_partial_messages=True,
-            cli_path="/usr/local/bin/claude",
+            stderr=_stderr_cb,
+            cli_path=provider_config.get("cli_path", "/usr/local/bin/claude"),
+            cwd=provider_config.get("cwd", "/app"),
         )
         if system_prompt:
             options.system_prompt = system_prompt
 
+        # Build user prompt: include last N conversation turns for context
+        user_prompt = self._build_agent_prompt(conversation)
+
+        tool_collector = kwargs.get("_tool_collector", None)
+        
         try:
-            async for msg in query(prompt=filtered_messages[-1]["content"], options=options):
+            async for msg in query(prompt=user_prompt, options=options):
                 if hasattr(msg, "content"):
                     for block in msg.content:
                         if hasattr(block, "text"):
                             yield block.text
+                        elif hasattr(block, "type"):
+                            # Stream tool_use blocks as visible indicators
+                            if block.type == "tool_use":
+                                tool_name = getattr(block, "name", "unknown")
+                                if tool_collector is not None:
+                                    tool_collector.append(tool_name)
+                                yield f"\n🔧 正在使用工具: {tool_name}..."
         except Exception as e:
-            yield f"⚠️ Claude Agent SDK 错误: {str(e)}"
+            err_detail = str(e)
+            if stderr_lines:
+                err_detail += "\n\nSTDERR:\n" + "\n".join(stderr_lines[-20:])
+            yield f"⚠️ Claude Agent SDK 错误: {err_detail}"
+
+    def _build_agent_prompt(self, conversation: List[Dict[str, str]]) -> str:
+        """Build a prompt from conversation history for the agent SDK."""
+        if not conversation:
+            return ""
+
+        # For single message, just return it
+        if len(conversation) == 1 and conversation[0]["role"] == "user":
+            return conversation[0]["content"]
+
+        # For multi-turn, format as a transcript
+        lines = []
+        for msg in conversation[-20:]:  # Last 20 messages
+            role_label = "用户" if msg["role"] == "user" else "助手"
+            content = msg["content"][:2000]  # Truncate long messages
+            lines.append(f"{role_label}: {content}")
+
+        return "\n".join(lines)
 
     async def _call_openai_compatible(
         self,

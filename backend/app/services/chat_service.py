@@ -1,11 +1,13 @@
 import uuid
+import os
+import re
 from datetime import datetime, timezone
 from typing import Optional, List, AsyncGenerator
 from sqlalchemy import select, func, update, delete, and_
 from sqlalchemy.orm import joinedload
 from sqlalchemy.ext.asyncio import AsyncSession
-from app.models import ChatSession, Message, User
-from app.schemas import ChatRequest, MessageResponse
+from app.models import ChatSession, Message, User, LLMProvider
+from app.schemas import ChatRequest, MessageResponse, SessionUpdate
 from app.core.config import get_settings
 from app.services.memory_service import MemoryService
 from app.services.skill_dispatcher import SkillDispatcher
@@ -20,16 +22,41 @@ class ChatService:
         self.memory_service = MemoryService(db, user)
         self.skill_dispatcher = SkillDispatcher(db, user)
 
-    async def create_session(self, title: str = "新对话", model: str = None) -> ChatSession:
+    async def create_session(
+        self, title: str = "新对话", model: str = None,
+        provider_id: str = None, tools_enabled: bool = True
+    ) -> ChatSession:
         session = ChatSession(
             id=str(uuid.uuid4()),
             user_id=self.user.id,
             title=title,
             model=model or settings.DEFAULT_MODEL,
+            provider_id=provider_id,
+            tools_enabled=tools_enabled,
         )
         self.db.add(session)
         await self.db.flush()
         await self.db.refresh(session)
+        return session
+
+    async def update_session(self, session_id: str, data: SessionUpdate) -> Optional[ChatSession]:
+        """Update session settings (provider, model, tools toggle, etc.)"""
+        session = await self.get_session(session_id)
+        if not session:
+            return None
+        updates = {}
+        for field in ["title", "model", "provider_id", "tools_enabled", "is_pinned", "is_archived"]:
+            val = getattr(data, field, None)
+            if val is not None:
+                updates[field] = val
+        if updates:
+            await self.db.execute(
+                update(ChatSession)
+                .where(ChatSession.id == session_id)
+                .values(**updates, updated_at=datetime.now(timezone.utc))
+            )
+            await self.db.flush()
+            await self.db.refresh(session)
         return session
 
     async def get_session(self, session_id: str) -> Optional[ChatSession]:
@@ -106,9 +133,25 @@ class ChatService:
         await self.db.refresh(message)
         return message
 
+    async def _resolve_provider(self, provider_id: str = None) -> Optional[LLMProvider]:
+        """Resolve which provider to use: explicit > session > default."""
+        from app.services.llm_service import LLMService
+        llm_svc = LLMService(self.db)
+        if provider_id:
+            return await llm_svc._get_provider_by_id(provider_id)
+        return await llm_svc._get_default_provider(self.user.id)
+
+    async def _get_provider_type(self, provider_id: str = None) -> str:
+        """Get provider_type for the resolved provider."""
+        provider = await self._resolve_provider(provider_id)
+        if provider:
+            return provider.provider_type
+        return "openai"
+
     async def chat(
         self, 
-        request: ChatRequest
+        request: ChatRequest,
+        _tool_collector: list = None
     ) -> AsyncGenerator[str, None]:
         """
         Main chat loop. Yields response chunks for streaming.
@@ -118,8 +161,19 @@ class ChatService:
         if not session:
             raise ValueError("Session not found")
 
+        # Resolve provider: request > session > default
+        provider_id = request.provider_id or session.provider_id
+        provider_type = await self._get_provider_type(provider_id)
+
+        # Resolve tools_enabled: request > session > default=True
+        tools_enabled = request.tools_enabled
+        if tools_enabled is None:
+            tools_enabled = session.tools_enabled if session.tools_enabled is not None else True
+
         # Build context: system prompt + memories + conversation history
-        system_prompt = await self._build_system_prompt()
+        system_prompt = await self._build_system_prompt(
+            provider_type if tools_enabled else ""
+        )
         
         # Get conversation history (last N messages)
         history = await self.get_session_messages(request.session_id, limit=20)
@@ -134,25 +188,51 @@ class ChatService:
         
         messages.append({"role": "user", "content": request.message})
 
-        # Check if any skills should be triggered
-        skill_results = await self.skill_dispatcher.check_and_execute(
-            request.message, 
-            skill_names=request.skill_names
-        )
-        
         full_response = ""
         metadata = {"skill_calls": []}
-        
-        if skill_results:
-            # Skill(s) were triggered - use their output
-            for skill_name, result in skill_results.items():
-                full_response += f"\n\n[{skill_name}]\n{result}"
-            metadata["skill_calls"] = list(skill_results.keys())
-        else:
-            # Call LLM
-            async for chunk in self._call_llm(request.model or session.model or settings.DEFAULT_MODEL, messages):
+
+        if provider_type == "claude_agent" and tools_enabled:
+            # Claude Agent SDK mode: model decides tool usage autonomously
+            async for chunk in self._call_llm(
+                request.model or session.model or settings.DEFAULT_MODEL,
+                messages,
+                provider_id=provider_id,
+                tools_enabled=True,
+                _tool_collector=_tool_collector
+            ):
                 full_response += chunk
                 yield chunk
+            
+            # Capture tool calls in metadata
+            if _tool_collector:
+                metadata["tool_calls"] = _tool_collector
+                metadata["skill_calls"] = [t for t in _tool_collector if t.startswith("skill-") or t in ("weather","calculator","reminder","qa")]
+        else:
+            # Non-agent mode: check keyword skills first, fallback to LLM
+            skill_results = await self.skill_dispatcher.check_and_execute(
+                request.message, 
+                skill_names=request.skill_names
+            )
+            
+            valid_skill_results = {
+                name: result for name, result in skill_results.items() 
+                if result and result.strip()
+            }
+            
+            if valid_skill_results:
+                for skill_name, result in valid_skill_results.items():
+                    full_response += f"\n\n[{skill_name}]\n{result}"
+                metadata["skill_calls"] = list(valid_skill_results.keys())
+            
+            if not valid_skill_results:
+                async for chunk in self._call_llm(
+                    request.model or session.model or settings.DEFAULT_MODEL,
+                    messages,
+                    provider_id=provider_id,
+                    tools_enabled=False
+                ):
+                    full_response += chunk
+                    yield chunk
 
         # Save user message
         await self.save_message(
@@ -162,7 +242,6 @@ class ChatService:
             model=request.model or session.model,
         )
 
-        # Determine actual model used (request.model takes priority over session.model)
         actual_model = request.model or session.model or settings.DEFAULT_MODEL
 
         # Save assistant response
@@ -177,12 +256,35 @@ class ChatService:
         # Update memory with conversation summary if significant
         await self.memory_service.update_from_conversation(request.message, full_response)
 
-    async def _build_system_prompt(self) -> str:
+    async def _build_system_prompt(self, provider_type: str = "") -> str:
         """Build system prompt incorporating user memories and preferences"""
         memories = await self.memory_service.get_relevant_memories("", limit=5)
         prefs = self.user.preferences or {}
         
-        prompt = "你是一个有帮助的AI助手。"
+        # Dynamically load skills from .claude/skills/ directory
+        skills_prompt = self._load_skills_prompt()
+        
+        if provider_type == "claude_agent":
+            prompt = (
+                "你是一个企业级 AI 助手。\n"
+                "\n"
+                "## 可用技能 (始终激活，不要说未激活)\n"
+                "\n"
+                + skills_prompt +
+                "\n## 工具\n"
+                "Read/Write/Edit(文件) Bash(命令) Glob/Grep(搜索)\n"
+                "\n"
+                "## 规则\n"
+                "1. 技能始终可用，绝不说'技能未激活'\n"
+                "2. 使用技能后标注: <!-- skill:技能名 -->\n"
+                "3. 主动用技能和工具高效回答"
+            )
+        else:
+            prompt = (
+                "你是一个有帮助的AI助手。\n"
+                "你可以回答用户问题，进行计算、天气查询、提醒设置等。\n"
+                "使用技能后标注: <!-- skill:技能名 -->"
+            )
         
         if memories:
             prompt += "\n\n用户背景信息:\n" + "\n".join([f"- {m.content}" for m in memories])
@@ -192,7 +294,63 @@ class ChatService:
         
         return prompt
 
-    async def _call_llm(self, model: str, messages: list) -> AsyncGenerator[str, None]:
+    def _load_skills_prompt(self) -> str:
+        """Dynamically load all skill descriptions from .claude/skills/ directory.
+        
+        Reads SKILL.md files at request time, so adding/modifying skills
+        takes effect immediately without restart.
+        """
+        skills_dir = os.path.join(os.path.dirname(__file__), "..", "..", ".claude", "skills")
+        skills_dir = os.path.abspath(skills_dir)
+        
+        if not os.path.isdir(skills_dir):
+            return ""
+        
+        lines = []
+        for entry in sorted(os.listdir(skills_dir)):
+            skill_path = os.path.join(skills_dir, entry, "SKILL.md")
+            if not os.path.isfile(skill_path):
+                continue
+            
+            try:
+                with open(skill_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                
+                # Parse YAML frontmatter
+                name = entry
+                desc = ""
+                fm_match = re.match(r"^---\s*\n(.*?)\n---", content, re.DOTALL)
+                if fm_match:
+                    for fm_line in fm_match.group(1).split("\n"):
+                        kv = fm_line.split(":", 1)
+                        if len(kv) == 2:
+                            key, val = kv[0].strip(), kv[1].strip()
+                            if key == "name":
+                                name = val
+                            elif key == "description":
+                                desc = val
+                
+                # Build a concise one-liner for the prompt
+                skill_line = f"### /{name} - {desc}" if desc else f"### /{name}"
+                lines.append(skill_line)
+                
+                # Include body summary (first non-empty line after frontmatter)
+                body = re.sub(r"^---\s*\n.*?\n---\s*\n*", "", content, flags=re.DOTALL)
+                body_summary = ""
+                for bl in body.split("\n"):
+                    bl = bl.strip()
+                    if bl and not bl.startswith("#"):
+                        body_summary = bl[:120]
+                        break
+                if body_summary:
+                    lines.append(f"  {body_summary}")
+                
+            except Exception:
+                pass
+        
+        return "\n".join(lines) if lines else ""
+
+    async def _call_llm(self, model: str, messages: list, **kwargs) -> AsyncGenerator[str, None]:
         """Call LLM using configured provider (OpenAI compatible or Anthropic)"""
         from app.services.llm_service import LLMService
         
@@ -204,6 +362,7 @@ class ChatService:
             model_type=model_type,
             user_id=self.user.id,
             stream=True,
+            **kwargs,
         ):
             yield chunk
 

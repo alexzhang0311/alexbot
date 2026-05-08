@@ -20,8 +20,14 @@ COPY . .
 COPY bin/claude.exe /usr/local/bin/claude
 RUN chmod +x /usr/local/bin/claude
 
+# Create non-root user for Claude Agent SDK (CLI refuses root + bypassPermissions)
+RUN useradd -m -s /bin/bash appuser && \
+    chown -R appuser:appuser /app
+
 # Create necessary directories
 RUN mkdir -p /app/logs /app/uploads
+
+USER appuser
 
 EXPOSE 8000
 

@@ -1,6 +1,9 @@
+import json
+import asyncio
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
-from typing import List
+from typing import List, AsyncGenerator
 from app.core.database import get_db
 from app.models import User, ChatSession, Message
 from app.schemas import (
@@ -20,8 +23,13 @@ async def create_session(
     user: User = Depends(get_current_user)
 ):
     chat_svc = ChatService(db, user)
-    session = await chat_svc.create_session(title=data.title, model=data.model)
-    return session
+    session = await chat_svc.create_session(
+        title=data.title,
+        model=data.model,
+        provider_id=data.provider_id,
+        tools_enabled=data.tools_enabled if data.tools_enabled is not None else True,
+    )
+    return _session_to_response(session)
 
 
 @router.get("/sessions", response_model=List[SessionResponse])
@@ -32,20 +40,7 @@ async def list_sessions(
 ):
     chat_svc = ChatService(db, user)
     sessions = await chat_svc.list_sessions(include_archived=include_archived)
-    return [
-        SessionResponse(
-            id=s.id,
-            user_id=s.user_id,
-            title=s.title,
-            model=s.model,
-            is_pinned=s.is_pinned,
-            is_archived=s.is_archived,
-            created_at=s.created_at,
-            updated_at=s.updated_at,
-            message_count=getattr(s, '_message_count', 0),
-        )
-        for s in sessions
-    ]
+    return [_session_to_response(s) for s in sessions]
 
 
 @router.get("/sessions/{session_id}", response_model=SessionResponse)
@@ -58,7 +53,7 @@ async def get_session(
     session = await chat_svc.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
-    return session
+    return _session_to_response(session)
 
 
 @router.patch("/sessions/{session_id}", response_model=SessionResponse)
@@ -69,20 +64,10 @@ async def update_session(
     user: User = Depends(get_current_user)
 ):
     chat_svc = ChatService(db, user)
-    session = await chat_svc.get_session(session_id)
+    session = await chat_svc.update_session(session_id, data)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
-    
-    if data.title is not None:
-        session.title = data.title
-    if data.is_pinned is not None:
-        session.is_pinned = data.is_pinned
-    if data.is_archived is not None:
-        session.is_archived = data.is_archived
-    
-    await db.flush()
-    await db.refresh(session)
-    return session
+    return _session_to_response(session)
 
 
 @router.delete("/sessions/{session_id}")
@@ -129,3 +114,61 @@ async def chat(
     # Get the saved message
     messages = await chat_svc.get_session_messages(request.session_id, limit=1)
     return messages[-1] if messages else None
+
+
+@router.post("/stream")
+async def chat_stream(
+    request: ChatRequest,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user)
+):
+    """Streaming chat via Server-Sent Events (SSE)."""
+    chat_svc = ChatService(db, user)
+    
+    async def generate() -> AsyncGenerator[str, None]:
+        tool_calls = []
+        full_response = ""
+        
+        try:
+            async for chunk in chat_svc.chat(request, _tool_collector=tool_calls):
+                full_response += chunk
+                yield f"data: {json.dumps({'type': 'text', 'content': chunk})}\n\n"
+            
+            # CRITICAL: commit DB transaction BEFORE sending 'done',
+            # so the frontend can reload messages from another connection.
+            await db.commit()
+            
+            # Send completion with metadata
+            yield f"data: {json.dumps({'type': 'done', 'tool_calls': tool_calls})}\n\n"
+        except asyncio.CancelledError:
+            await db.rollback()
+        except Exception as e:
+            await db.rollback()
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+    
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+def _session_to_response(session: ChatSession) -> SessionResponse:
+    """Convert ChatSession model to response, including new fields."""
+    return SessionResponse(
+        id=session.id,
+        user_id=session.user_id,
+        title=session.title,
+        model=session.model,
+        provider_id=getattr(session, 'provider_id', None),
+        tools_enabled=getattr(session, 'tools_enabled', True),
+        is_pinned=session.is_pinned,
+        is_archived=session.is_archived,
+        created_at=session.created_at,
+        updated_at=session.updated_at,
+        message_count=getattr(session, '_message_count', 0),
+    )

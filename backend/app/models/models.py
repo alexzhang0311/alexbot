@@ -34,6 +34,8 @@ class ChatSession(Base):
     user_id = Column(String(64), ForeignKey("users.id"), nullable=False)
     title = Column(String(256), default="新对话")
     model = Column(String(64), default="gpt-4o")
+    provider_id = Column(String(64), nullable=True)  # specific LLM provider
+    tools_enabled = Column(Boolean, default=True)     # enable agent tools (bash, file ops, skills)
     is_pinned = Column(Boolean, default=False)
     is_archived = Column(Boolean, default=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())

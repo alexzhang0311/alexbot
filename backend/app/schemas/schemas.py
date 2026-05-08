@@ -49,11 +49,15 @@ class SessionBase(BaseModel):
 
 
 class SessionCreate(SessionBase):
-    pass
+    provider_id: Optional[str] = None
+    tools_enabled: Optional[bool] = True
 
 
 class SessionUpdate(BaseModel):
     title: Optional[str] = None
+    model: Optional[str] = None
+    provider_id: Optional[str] = None
+    tools_enabled: Optional[bool] = None
     is_pinned: Optional[bool] = None
     is_archived: Optional[bool] = None
 
@@ -61,6 +65,8 @@ class SessionUpdate(BaseModel):
 class SessionResponse(SessionBase):
     id: str
     user_id: str
+    provider_id: Optional[str] = None
+    tools_enabled: bool = True
     is_pinned: bool
     is_archived: bool
     created_at: datetime
@@ -101,6 +107,8 @@ class ChatRequest(BaseModel):
     session_id: str
     message: str
     model: Optional[str] = None
+    provider_id: Optional[str] = None      # use specific provider
+    tools_enabled: Optional[bool] = None   # enable/disable agent tools
     stream: bool = True
     skill_names: Optional[List[str]] = None  # which skills to enable for this turn
 

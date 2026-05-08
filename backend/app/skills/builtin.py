@@ -76,7 +76,8 @@ class QASkill(Skill):
     """General Q&A knowledge base skill"""
     name = "qa"
     description = "常见问答"
-    trigger_keywords = ["什么是", "怎么", "如何", "why", "how", "what", "who"]
+    # Only trigger on Chinese FAQ phrases, avoid English question words which are too broad
+    trigger_keywords = ["什么是", "怎么", "如何", "怎么改密码", "怎么联系客服", "怎么升级会员"]
 
     async def execute(self, query: str, **kwargs) -> str:
         # Simple FAQ - in production, use vector search or knowledge graph
