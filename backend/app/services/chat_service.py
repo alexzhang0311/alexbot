@@ -148,6 +148,14 @@ class ChatService:
             return provider.provider_type
         return "openai"
 
+    async def _resolve_model(self, model_key: str, provider_id: str = None) -> str:
+        """Resolve actual model name from provider config."""
+        provider = await self._resolve_provider(provider_id)
+        if provider and provider.models:
+            model_type = self._get_model_type(model_key)
+            return provider.models.get(model_type, provider.models.get("default", model_key))
+        return model_key
+
     async def chat(
         self, 
         request: ChatRequest,
@@ -164,6 +172,10 @@ class ChatService:
         # Resolve provider: request > session > default
         provider_id = request.provider_id or session.provider_id
         provider_type = await self._get_provider_type(provider_id)
+
+        # Resolve model: resolve model_key through provider to get actual model name
+        model_key = request.model or session.model or settings.DEFAULT_MODEL
+        actual_model = await self._resolve_model(model_key, provider_id)
 
         # Resolve tools_enabled: request > session > default=True
         tools_enabled = request.tools_enabled
@@ -194,7 +206,7 @@ class ChatService:
         if provider_type == "claude_agent" and tools_enabled:
             # Claude Agent SDK mode: model decides tool usage autonomously
             async for chunk in self._call_llm(
-                request.model or session.model or settings.DEFAULT_MODEL,
+                actual_model,
                 messages,
                 provider_id=provider_id,
                 tools_enabled=True,
@@ -226,7 +238,7 @@ class ChatService:
             
             if not valid_skill_results:
                 async for chunk in self._call_llm(
-                    request.model or session.model or settings.DEFAULT_MODEL,
+                    actual_model,
                     messages,
                     provider_id=provider_id,
                     tools_enabled=False
@@ -239,10 +251,8 @@ class ChatService:
             session_id=request.session_id,
             role="user",
             content=request.message,
-            model=request.model or session.model,
+            model=actual_model,
         )
-
-        actual_model = request.model or session.model or settings.DEFAULT_MODEL
 
         # Save assistant response
         await self.save_message(

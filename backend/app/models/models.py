@@ -33,7 +33,7 @@ class ChatSession(Base):
     id = Column(String(64), primary_key=True)
     user_id = Column(String(64), ForeignKey("users.id"), nullable=False)
     title = Column(String(256), default="新对话")
-    model = Column(String(64), default="gpt-4o")
+    model = Column(String(64), default="default")  # model key, resolved via provider
     provider_id = Column(String(64), nullable=True)  # specific LLM provider
     tools_enabled = Column(Boolean, default=True)     # enable agent tools (bash, file ops, skills)
     is_pinned = Column(Boolean, default=False)
