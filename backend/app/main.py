@@ -16,7 +16,10 @@ settings = get_settings()
 async def _seed_default_provider():
     """Create a default LLM provider if none exist (dev mode only)."""
     import uuid
+    import shutil
+    import os as _os
     from app.models import LLMProvider
+    from app.services.llm_service import LLMService
 
     async with async_session() as session:
         result = await session.execute(
@@ -26,19 +29,42 @@ async def _seed_default_provider():
         if count > 0:
             return  # already has providers
 
-        provider = LLMProvider(
-            id=str(uuid.uuid4()),
-            name="MiniMax (默认)",
-            provider_type="openai",  # openai-compatible, works everywhere
-            base_url="https://api.minimax.chat/v1",
-            api_key=settings.OPENAI_API_KEY or "",
-            is_default=True,
-            models={"default": "MiniMax-M2.7"},
-            config={"timeout": 120},
-        )
+        # Auto-detect Claude CLI availability
+        claude_path = LLMService._resolve_claude_cli("/usr/local/bin/claude")
+        has_claude_cli = shutil.which(claude_path) is not None or _os.path.isfile(claude_path)
+
+        if has_claude_cli:
+            provider = LLMProvider(
+                id=str(uuid.uuid4()),
+                name="Claude Agent (默认)",
+                provider_type="claude_agent",
+                base_url="https://api.minimax.chat/v1",  # MiniMax Anthropic-compatible
+                api_key=settings.OPENAI_API_KEY or "",
+                is_default=True,
+                models={"default": "MiniMax-M2.7"},
+                config={
+                    "timeout": 120,
+                    "cli_path": claude_path,
+                    "cwd": str(_os.getcwd()),
+                    "tools_enabled": True,
+                },
+            )
+            logger.info(f"Seeded default: Claude Agent (cli={claude_path})")
+        else:
+            provider = LLMProvider(
+                id=str(uuid.uuid4()),
+                name="MiniMax (默认)",
+                provider_type="openai",  # fallback: works everywhere
+                base_url="https://api.minimax.chat/v1",
+                api_key=settings.OPENAI_API_KEY or "",
+                is_default=True,
+                models={"default": "MiniMax-M2.7"},
+                config={"timeout": 120},
+            )
+            logger.info("Seeded default: MiniMax (OpenAI-compatible) — install Claude CLI for Claude Agent")
+
         session.add(provider)
         await session.commit()
-        logger.info("Seeded default LLM provider: MiniMax (OpenAI-compatible)")
 
 
 async def _run_migrations(conn):

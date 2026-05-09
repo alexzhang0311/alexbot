@@ -97,6 +97,36 @@ class LLMService:
             async for chunk in self._call_openai_compatible(provider, model_name, messages, stream, **kwargs):
                 yield chunk
 
+    @staticmethod
+    def _resolve_claude_cli(configured_path: str) -> str:
+        """Resolve Claude CLI path. Auto-detect if configured path is the default."""
+        import shutil
+        import platform
+
+        # If user explicitly set a path, use it
+        default_paths = {"/usr/local/bin/claude", "/usr/bin/claude", "claude"}
+        if configured_path and configured_path not in default_paths:
+            return configured_path
+
+        # Auto-detect: try shutil.which first (works cross-platform)
+        found = shutil.which("claude")
+        if found:
+            return found
+
+        # On Windows, also try claude.cmd (npm global bin)
+        if platform.system() == "Windows":
+            found = shutil.which("claude.cmd")
+            if found:
+                return found
+            # Try common npm global paths
+            import os as _os
+            for base in [_os.environ.get("APPDATA", ""), _os.environ.get("LOCALAPPDATA", "")]:
+                candidate = _os.path.join(base, "npm", "claude.cmd")
+                if _os.path.isfile(candidate):
+                    return candidate
+
+        return configured_path or "claude"
+
     async def _call_claude_agent(
         self,
         provider: LLMProvider,
@@ -108,6 +138,7 @@ class LLMService:
         """Call Claude Agent SDK with tool support (skills, bash, file ops)"""
         from claude_agent_sdk import query, ClaudeAgentOptions
         import os
+        import platform
 
         # Split system prompt from conversation messages
         system_prompt = ""
@@ -136,6 +167,12 @@ class LLMService:
         else:
             allowed_tools = []
 
+        # Resolve CLI path — auto-detect on each platform
+        resolved_cli = self._resolve_claude_cli(
+            provider_config.get("cli_path", "/usr/local/bin/claude")
+        )
+        resolved_cwd = provider_config.get("cwd", os.getcwd())
+
         # Capture stderr for better error diagnostics
         stderr_lines = []
         def _stderr_cb(line: str):
@@ -149,8 +186,8 @@ class LLMService:
             env=env,
             include_partial_messages=True,
             stderr=_stderr_cb,
-            cli_path=provider_config.get("cli_path", "/usr/local/bin/claude"),
-            cwd=provider_config.get("cwd", "/app"),
+            cli_path=resolved_cli,
+            cwd=resolved_cwd,
         )
         if system_prompt:
             options.system_prompt = system_prompt
