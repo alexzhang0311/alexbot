@@ -7,10 +7,38 @@ from loguru import logger
 from sqlalchemy import text
 
 from app.core.config import get_settings
-from app.core.database import engine, Base
+from app.core.database import engine, Base, async_session
 from app.api import auth_router, chat_router, ws_router, memory_router, tasks_router, skills_router, llm_router
 
 settings = get_settings()
+
+
+async def _seed_default_provider():
+    """Create a default LLM provider if none exist (dev mode only)."""
+    import uuid
+    from app.models import LLMProvider
+
+    async with async_session() as session:
+        result = await session.execute(
+            text("SELECT COUNT(*) FROM llm_providers")
+        )
+        count = result.scalar()
+        if count > 0:
+            return  # already has providers
+
+        provider = LLMProvider(
+            id=str(uuid.uuid4()),
+            name="MiniMax (默认)",
+            provider_type="openai",  # openai-compatible, works everywhere
+            base_url="https://api.minimax.chat/v1",
+            api_key=settings.OPENAI_API_KEY or "",
+            is_default=True,
+            models={"default": "MiniMax-M2.7"},
+            config={"timeout": 120},
+        )
+        session.add(provider)
+        await session.commit()
+        logger.info("Seeded default LLM provider: MiniMax (OpenAI-compatible)")
 
 
 async def _run_migrations(conn):
@@ -40,6 +68,10 @@ async def lifespan(app: FastAPI):
     if not settings.is_dev:
         async with engine.begin() as conn:
             await _run_migrations(conn)
+
+    # Seed default LLM provider in dev mode
+    if settings.is_dev:
+        await _seed_default_provider()
 
     logger.info("Database tables ready")
     yield

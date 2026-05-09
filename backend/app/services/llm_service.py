@@ -177,7 +177,24 @@ class LLMService:
             err_detail = str(e)
             if stderr_lines:
                 err_detail += "\n\nSTDERR:\n" + "\n".join(stderr_lines[-20:])
-            yield f"⚠️ Claude Agent SDK 错误: {err_detail}"
+
+            # Friendly guidance for common issues
+            hint = ""
+            err_lower = err_detail.lower()
+            if "failed to start" in err_lower or "no such file" in err_lower or "not found" in err_lower:
+                import platform
+                if platform.system() == "Windows":
+                    hint = (
+                        "\n\n💡 Claude Code CLI 在 Windows 上不可用。"
+                        "请在 LLM 设置中将 Provider 类型改为 'openai' 或 'anthropic'，"
+                        "它们通过 HTTP API 直接调用，无需本地 CLI。"
+                    )
+                else:
+                    hint = (
+                        "\n\n💡 请确认 Claude Code CLI 已安装：npm install -g @anthropic-ai/claude-code"
+                        "\n或在 LLM 设置中改用 'openai' / 'anthropic' 类型的 Provider。"
+                    )
+            yield f"⚠️ Claude Agent SDK 错误: {err_detail}{hint}"
 
     def _build_agent_prompt(self, conversation: List[Dict[str, str]]) -> str:
         """Build a prompt from conversation history for the agent SDK."""
