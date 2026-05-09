@@ -38,7 +38,7 @@ async def _seed_default_provider():
                 id=str(uuid.uuid4()),
                 name="Claude Agent (默认)",
                 provider_type="claude_agent",
-                base_url="https://api.minimax.chat/v1",  # MiniMax Anthropic-compatible
+                base_url="https://api.minimax.chat/anthropic",
                 api_key=settings.OPENAI_API_KEY or "",
                 is_default=True,
                 models={"default": "MiniMax-M2.7"},

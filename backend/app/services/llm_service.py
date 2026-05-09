@@ -197,7 +197,15 @@ class LLMService:
 
         tool_collector = kwargs.get("_tool_collector", None)
         
+        # ── Debug logging ──────────────────────────────────────────
+        from loguru import logger as _log
+        _log.info(f"Claude Agent: cli={resolved_cli} cwd={resolved_cwd} model={model}")
+        _log.info(f"Claude Agent: base_url={provider.base_url} tools={len(allowed_tools)}")
+        _log.info(f"Claude Agent: env ANTHROPIC_BASE_URL={env.get('ANTHROPIC_BASE_URL','N/A')}")
+        _log.info(f"Claude Agent: env ANTHROPIC_API_KEY={'***' if env.get('ANTHROPIC_API_KEY') else 'NOT SET'}")
+
         try:
+            _log.info("Claude Agent: calling query()...")
             async for msg in query(prompt=user_prompt, options=options):
                 if hasattr(msg, "content"):
                     for block in msg.content:
@@ -210,26 +218,32 @@ class LLMService:
                                 if tool_collector is not None:
                                     tool_collector.append(tool_name)
                                 yield f"\n🔧 正在使用工具: {tool_name}..."
+            _log.info("Claude Agent: query() completed")
         except Exception as e:
+            import traceback
+            _log.error(f"Claude Agent SDK failed: {e}")
             err_detail = str(e)
             if stderr_lines:
                 err_detail += "\n\nSTDERR:\n" + "\n".join(stderr_lines[-20:])
 
+            # Include full traceback for debugging
+            tb = traceback.format_exc()
+            err_detail += f"\n\nTRACEBACK:\n{tb}"
+
             # Friendly guidance for common issues
             hint = ""
-            err_lower = err_detail.lower()
+            err_lower = (str(e) + "\n".join(stderr_lines)).lower()
             if "failed to start" in err_lower or "no such file" in err_lower or "not found" in err_lower:
-                import platform
                 if platform.system() == "Windows":
                     hint = (
-                        "\n\n💡 Claude Code CLI 在 Windows 上不可用。"
-                        "请在 LLM 设置中将 Provider 类型改为 'openai' 或 'anthropic'，"
-                        "它们通过 HTTP API 直接调用，无需本地 CLI。"
+                        "\n\n💡 确认 Node.js 已安装且 claude 在 PATH 中。"
+                        f"\n当前 CLI 路径: {resolved_cli}"
+                        f"\n当前工作目录: {resolved_cwd}"
                     )
                 else:
                     hint = (
-                        "\n\n💡 请确认 Claude Code CLI 已安装：npm install -g @anthropic-ai/claude-code"
-                        "\n或在 LLM 设置中改用 'openai' / 'anthropic' 类型的 Provider。"
+                        f"\n\n💡 CLI 路径: {resolved_cli} 工作目录: {resolved_cwd}"
+                        "\n确认 Claude Code CLI 已安装：npm install -g @anthropic-ai/claude-code"
                     )
             yield f"⚠️ Claude Agent SDK 错误: {err_detail}{hint}"
 
