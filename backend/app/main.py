@@ -1,4 +1,12 @@
 import os
+import sys
+import asyncio
+
+# Windows + Python 3.13: ProactorEventLoop doesn't support subprocess pipes.
+# Claude Agent SDK needs subprocess_exec, so switch to SelectorEventLoop.
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
