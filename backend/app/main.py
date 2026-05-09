@@ -1,5 +1,7 @@
+import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from contextlib import asynccontextmanager
 from loguru import logger
 from sqlalchemy import text
@@ -28,17 +30,18 @@ async def _run_migrations(conn):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
-    logger.info("Starting up...")
+    logger.info(f"Starting up in {settings.ENVIRONMENT} mode (DB: {settings.DATABASE_URL[:50]}...)")
     
-    # Create tables
+    # Create tables (works for both SQLite and PostgreSQL)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-    
-    # Run migrations for new columns (PostgreSQL)
-    async with engine.begin() as conn:
-        await _run_migrations(conn)
 
-    logger.info("Database tables created")
+    # Run migrations only on PostgreSQL (SQLite handles column adds differently)
+    if not settings.is_dev:
+        async with engine.begin() as conn:
+            await _run_migrations(conn)
+
+    logger.info("Database tables ready")
     yield
     
     # Shutdown
@@ -71,10 +74,22 @@ app.include_router(tasks_router)
 app.include_router(skills_router)
 app.include_router(llm_router)
 
-
-@app.get("/")
-async def root():
-    return {"message": "AI Web Tool API", "version": "1.0.0"}
+# ── Dev mode: serve frontend static files directly ─────────────────
+if settings.is_dev:
+    frontend_dir = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "frontend", "public")
+    )
+    if os.path.isdir(frontend_dir):
+        # Mounted last → only catches paths that don't match API routes
+        app.mount("/", StaticFiles(directory=frontend_dir, html=True), name="frontend")
+        logger.info(f"Dev mode: serving frontend from {frontend_dir}")
+    else:
+        logger.warning(f"Dev mode: frontend dir not found at {frontend_dir}")
+else:
+    # Production root endpoint
+    @app.get("/")
+    async def root():
+        return {"message": "AI Web Tool API", "version": "1.0.0"}
 
 
 @app.get("/health")
