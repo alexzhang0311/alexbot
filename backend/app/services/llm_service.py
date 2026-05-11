@@ -206,6 +206,9 @@ class LLMService:
             "stderr": _stderr_cb,
             "cwd": resolved_cwd,
         }
+        # ── Debug logging ──────────────────────────────────────────
+        from loguru import logger as _log
+
         if resolved_cli:
             options_kwargs["cli_path"] = resolved_cli
             _log.info(f"Claude Agent: using explicit cli_path={resolved_cli}")
@@ -220,9 +223,6 @@ class LLMService:
         user_prompt = self._build_agent_prompt(conversation)
 
         tool_collector = kwargs.get("_tool_collector", None)
-
-        # ── Debug logging ──────────────────────────────────────────
-        from loguru import logger as _log
         _log.info(f"Claude Agent: cwd={resolved_cwd} model={model} cli={'auto-detect' if not resolved_cli else resolved_cli}")
         _log.info(f"Claude Agent: base_url={provider.base_url} tools={len(allowed_tools)}")
         _log.info(f"Claude Agent: env ANTHROPIC_BASE_URL={env.get('ANTHROPIC_BASE_URL','N/A')}")
