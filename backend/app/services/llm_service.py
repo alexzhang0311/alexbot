@@ -107,23 +107,39 @@ class LLMService:
         """
         import shutil
         import os as _os
+        import platform
 
-        # If user explicitly set a non-default path, validate and use it
+        from loguru import logger as _log
+
+        # Paths that should never be passed to the SDK — let it auto-detect.
         default_paths = {"/usr/local/bin/claude", "/usr/bin/claude", "claude", None}
+
         if configured_path and configured_path not in default_paths:
+            # On Windows, npm global installs create .CMD wrapper scripts that
+            # don't work via anyio.open_process. Skip them — SDK's bundled
+            # claude.exe is the real binary.
+            if platform.system() == "Windows" and configured_path.lower().endswith(".cmd"):
+                _log.warning(
+                    f"Skipping .CMD wrapper '{configured_path}' — "
+                    "SDK will use bundled claude.exe instead"
+                )
+                return None
+
             if _os.path.isfile(configured_path) or shutil.which(configured_path):
                 return configured_path
-            # Explicit path doesn't exist — warn and fall through to None
-            from loguru import logger as _log
-            _log.warning(f"Configured cli_path '{configured_path}' not found, falling back to SDK auto-detect")
+
+            _log.warning(
+                f"Configured cli_path '{configured_path}' not found, "
+                "falling back to SDK auto-detect"
+            )
             return None
 
-        # No explicit path (or it's a default) — let SDK auto-detect.
+        # No explicit path (or it's a default / .CMD wrapper) — let SDK auto-detect.
         # SDK's SubprocessCLITransport._find_cli() checks:
         #   1. Bundled binary (_bundled/claude or _bundled/claude.exe)
         #   2. shutil.which("claude")
         #   3. Common install paths
-        # Passing a non-existent cli_path prevents SDK from finding the bundled CLI.
+        # Passing any cli_path prevents SDK from finding the bundled CLI.
         return None
 
     async def _call_claude_agent(

@@ -36,13 +36,18 @@ async def _seed_default_provider():
         if count > 0:
             return  # already has providers
 
-        # Check if claude CLI is available anywhere (bundled or system PATH).
-        # SDK auto-detects at runtime, so we only need a rough check for seeding.
-        has_claude = shutil.which("claude") is not None
-
-        if has_claude:
-            # Explicit path found — store it so SDK doesn't need to search
+        # Check if claude CLI is available (system PATH, not .CMD wrappers).
+        # On Windows, npm global installs create wrapper .CMD scripts that don't
+        # work with anyio.open_process. Prefer SDK's bundled claude.exe.
+        # On Linux/macOS, a real binary in PATH is fine to store.
+        import platform
+        has_claude = False
+        claude_path = None
+        if platform.system() != "Windows":
             claude_path = shutil.which("claude")
+            has_claude = claude_path is not None
+
+        if has_claude and claude_path:
             config = {
                 "timeout": 120,
                 "cli_path": claude_path,
@@ -51,7 +56,7 @@ async def _seed_default_provider():
             }
             logger.info(f"Seeded default: Claude Agent (cli={claude_path})")
         else:
-            # No system claude found — seed claude_agent anyway.
+            # No system claude found (or on Windows) — seed claude_agent anyway.
             # SDK will use its bundled CLI at runtime (no separate install needed).
             config = {
                 "timeout": 120,
