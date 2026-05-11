@@ -245,7 +245,19 @@ class LLMService:
             _log.info("Claude Agent: query() completed")
         except Exception as e:
             import traceback
+
+            # Unwrap cause chain for detailed diagnostics
+            cause = e
+            cause_chain = []
+            while cause is not None:
+                cause_chain.append(f"{type(cause).__name__}: {cause}")
+                cause = cause.__cause__
+                if len(cause_chain) > 5:
+                    break
+
             _log.error(f"Claude Agent SDK failed: {e}")
+            _log.error(f"Cause chain: {' ← '.join(cause_chain)}")
+
             err_detail = str(e)
             if stderr_lines:
                 err_detail += "\n\nSTDERR:\n" + "\n".join(stderr_lines[-20:])
@@ -256,7 +268,7 @@ class LLMService:
 
             # Friendly guidance for common issues
             hint = ""
-            err_lower = (str(e) + "\n".join(stderr_lines)).lower()
+            err_lower = (str(e) + "\n" + "\n".join(cause_chain) + "\n" + "\n".join(stderr_lines)).lower()
             if "failed to start" in err_lower or "no such file" in err_lower or "not found" in err_lower or "notimplementederror" in err_lower:
                 if platform.system() == "Windows":
                     hint = (
