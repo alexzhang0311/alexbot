@@ -3,9 +3,133 @@ import httpx
 from sqlalchemy import select, update, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 import uuid
+import anyio
+import anyio._backends._asyncio
 
 from app.models import LLMProvider, User
 from app.core.config import get_settings
+
+
+def _patch_anyio_open_process():
+    """Monkey-patch anyio.open_process to use subprocess.Popen + thread pool.
+
+    Python 3.13 on Windows: _WindowsSelectorEventLoop._make_subprocess_transport
+    is broken (BaseEventLoop NotImplementedError). This bypasses asyncio
+    subprocess entirely, using real pipes via subprocess.Popen in a thread.
+    """
+    import anyio
+    import anyio._backends._asyncio
+    import subprocess as _subprocess
+    import asyncio as _asyncio
+    from loguru import logger as _log
+
+    _original = anyio._backends._asyncio.AsyncIOBackend.open_process
+
+    @classmethod
+    async def _patched_open_process(
+        cls,
+        command,
+        *,
+        shell: bool = False,
+        stdin=None,
+        stdout=None,
+        stderr=None,
+        cwd=None,
+        env=None,
+        bufsize: int = 0,
+    ):
+        loop = _asyncio.get_running_loop()
+
+        def _resolve(setting):
+            if setting is anyio.subprocess.PIPE:
+                return _subprocess.PIPE
+            if setting is anyio.subprocess.DEVNULL:
+                return _subprocess.DEVNULL
+            return setting
+
+        _log.debug(f"[anyio_patch] spawning: {command}")
+
+        proc = await loop.run_in_executor(
+            None,
+            lambda: _subprocess.Popen(
+                command,
+                shell=shell,
+                stdin=_resolve(stdin),
+                stdout=_resolve(stdout),
+                stderr=_resolve(stderr),
+                cwd=cwd,
+                env=env,
+                bufsize=bufsize,
+            ),
+        )
+
+        # ── Async pipe wrappers ────────────────────────────────────
+        class _SendStream:
+            """ByteSendStream: wraps a writable pipe."""
+            def __init__(self, pipe):
+                self._pipe = pipe
+
+            async def send(self, item: bytes):
+                await loop.run_in_executor(None, self._pipe.write, item)
+                await loop.run_in_executor(None, self._pipe.flush)
+
+            async def aclose(self):
+                await loop.run_in_executor(None, self._pipe.close)
+
+        class _ReceiveStream:
+            """ByteReceiveStream: wraps a readable pipe."""
+            def __init__(self, pipe):
+                self._pipe = pipe
+
+            async def receive(self, max_bytes: int = 65536) -> bytes:
+                return await loop.run_in_executor(
+                    None, self._pipe.read, max_bytes
+                )
+
+            async def aclose(self):
+                await loop.run_in_executor(None, self._pipe.close)
+
+        class _PatchedProcess:
+            def __init__(self, proc):
+                self._proc = proc
+                self.pid = proc.pid
+                self.stdin = _SendStream(proc.stdin) if proc.stdin else None
+                self.stdout = (
+                    _ReceiveStream(proc.stdout) if proc.stdout else None
+                )
+                self.stderr = (
+                    _ReceiveStream(proc.stderr) if proc.stderr else None
+                )
+
+            @property
+            def returncode(self):
+                return self._proc.returncode
+
+            async def wait(self) -> int:
+                return await loop.run_in_executor(None, self._proc.wait)
+
+            def terminate(self):
+                self._proc.terminate()
+
+            def kill(self):
+                self._proc.kill()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                if self.stdin:
+                    await self.stdin.aclose()
+                if self.stdout:
+                    await self.stdout.aclose()
+                if self.stderr:
+                    await self.stderr.aclose()
+                await self.wait()
+
+        return _PatchedProcess(proc)
+
+    anyio._backends._asyncio.AsyncIOBackend.open_process = _patched_open_process
+    _log.info("[anyio_patch] installed")
 
 
 class LLMService:
@@ -228,18 +352,16 @@ class LLMService:
         _log.info(f"Claude Agent: env ANTHROPIC_BASE_URL={env.get('ANTHROPIC_BASE_URL','N/A')}")
         _log.info(f"Claude Agent: env ANTHROPIC_API_KEY={'***' if env.get('ANTHROPIC_API_KEY') else 'NOT SET'}")
 
-        # Python 3.13 on Windows: _WindowsSelectorEventLoop delegates
-        # _make_subprocess_transport to BaseEventLoop → NotImplementedError.
-        # Patch it to use BaseProactorEventLoop's implementation instead.
-        if platform.system() == "Windows":
-            import asyncio as _aio
-            _loop = _aio.get_running_loop()
-            _log.info(f"Claude Agent: running loop = {type(_loop).__name__}")
-            if not hasattr(_loop, '_make_subprocess_transport_patched'):
-                from asyncio import proactor_events as _pe
-                _loop._make_subprocess_transport = _pe.BaseProactorEventLoop._make_subprocess_transport.__get__(_loop)
-                _loop._make_subprocess_transport_patched = True
-                _log.info("Claude Agent: patched _make_subprocess_transport")
+        # Python 3.13 on Windows: _WindowsSelectorEventLoop._make_subprocess_transport
+        # is broken (delegates to BaseEventLoop → NotImplementedError).
+        # Bypass asyncio.create_subprocess_exec entirely by monkey-patching
+        # anyio's open_process to use subprocess.Popen in a thread pool.
+        if platform.system() == "Windows" and not getattr(
+            anyio._backends._asyncio.AsyncIOBackend, "_open_process_patched", False
+        ):
+            _log.info("Claude Agent: patching anyio.open_process for Windows")
+            _patch_anyio_open_process()
+            anyio._backends._asyncio.AsyncIOBackend._open_process_patched = True
 
         try:
             _log.info("Claude Agent: calling query()...")
