@@ -98,34 +98,33 @@ class LLMService:
                 yield chunk
 
     @staticmethod
-    def _resolve_claude_cli(configured_path: str) -> str:
-        """Resolve Claude CLI path. Auto-detect if configured path is the default."""
+    def _resolve_claude_cli(configured_path: str | None) -> str | None:
+        """Resolve Claude CLI path.
+
+        Returns:
+            A valid CLI path, or None to let the SDK auto-detect
+            (SDK checks bundled binary first, then system PATH).
+        """
         import shutil
-        import platform
+        import os as _os
 
-        # If user explicitly set a path, use it
-        default_paths = {"/usr/local/bin/claude", "/usr/bin/claude", "claude"}
+        # If user explicitly set a non-default path, validate and use it
+        default_paths = {"/usr/local/bin/claude", "/usr/bin/claude", "claude", None}
         if configured_path and configured_path not in default_paths:
-            return configured_path
+            if _os.path.isfile(configured_path) or shutil.which(configured_path):
+                return configured_path
+            # Explicit path doesn't exist — warn and fall through to None
+            from loguru import logger as _log
+            _log.warning(f"Configured cli_path '{configured_path}' not found, falling back to SDK auto-detect")
+            return None
 
-        # Auto-detect: try shutil.which first (works cross-platform)
-        found = shutil.which("claude")
-        if found:
-            return found
-
-        # On Windows, also try claude.cmd (npm global bin)
-        if platform.system() == "Windows":
-            found = shutil.which("claude.cmd")
-            if found:
-                return found
-            # Try common npm global paths
-            import os as _os
-            for base in [_os.environ.get("APPDATA", ""), _os.environ.get("LOCALAPPDATA", "")]:
-                candidate = _os.path.join(base, "npm", "claude.cmd")
-                if _os.path.isfile(candidate):
-                    return candidate
-
-        return configured_path or "claude"
+        # No explicit path (or it's a default) — let SDK auto-detect.
+        # SDK's SubprocessCLITransport._find_cli() checks:
+        #   1. Bundled binary (_bundled/claude or _bundled/claude.exe)
+        #   2. shutil.which("claude")
+        #   3. Common install paths
+        # Passing a non-existent cli_path prevents SDK from finding the bundled CLI.
+        return None
 
     async def _call_claude_agent(
         self,
@@ -167,9 +166,11 @@ class LLMService:
         else:
             allowed_tools = []
 
-        # Resolve CLI path — auto-detect on each platform
+        # Resolve CLI path.
+        # Only pass cli_path if it's a validated, existing path.
+        # When None, SDK auto-detects (bundled CLI → system PATH → common paths).
         resolved_cli = self._resolve_claude_cli(
-            provider_config.get("cli_path", "/usr/local/bin/claude")
+            provider_config.get("cli_path")
         )
         resolved_cwd = provider_config.get("cwd", os.getcwd())
 
@@ -178,17 +179,24 @@ class LLMService:
         def _stderr_cb(line: str):
             stderr_lines.append(line)
 
-        options = ClaudeAgentOptions(
-            model=model,
-            allowed_tools=allowed_tools,
-            skills=["weather", "calculator", "reminder", "qa"],
-            permission_mode="bypassPermissions",
-            env=env,
-            include_partial_messages=True,
-            stderr=_stderr_cb,
-            cli_path=resolved_cli,
-            cwd=resolved_cwd,
-        )
+        # Build options — only set cli_path when we have a verified path
+        options_kwargs: dict = {
+            "model": model,
+            "allowed_tools": allowed_tools,
+            "skills": ["weather", "calculator", "reminder", "qa"],
+            "permission_mode": "bypassPermissions",
+            "env": env,
+            "include_partial_messages": True,
+            "stderr": _stderr_cb,
+            "cwd": resolved_cwd,
+        }
+        if resolved_cli:
+            options_kwargs["cli_path"] = resolved_cli
+            _log.info(f"Claude Agent: using explicit cli_path={resolved_cli}")
+        else:
+            _log.info("Claude Agent: no cli_path set, SDK will auto-detect (bundled → PATH)")
+
+        options = ClaudeAgentOptions(**options_kwargs)
         if system_prompt:
             options.system_prompt = system_prompt
 
@@ -196,10 +204,10 @@ class LLMService:
         user_prompt = self._build_agent_prompt(conversation)
 
         tool_collector = kwargs.get("_tool_collector", None)
-        
+
         # ── Debug logging ──────────────────────────────────────────
         from loguru import logger as _log
-        _log.info(f"Claude Agent: cli={resolved_cli} cwd={resolved_cwd} model={model}")
+        _log.info(f"Claude Agent: cwd={resolved_cwd} model={model} cli={'auto-detect' if not resolved_cli else resolved_cli}")
         _log.info(f"Claude Agent: base_url={provider.base_url} tools={len(allowed_tools)}")
         _log.info(f"Claude Agent: env ANTHROPIC_BASE_URL={env.get('ANTHROPIC_BASE_URL','N/A')}")
         _log.info(f"Claude Agent: env ANTHROPIC_API_KEY={'***' if env.get('ANTHROPIC_API_KEY') else 'NOT SET'}")
@@ -233,17 +241,24 @@ class LLMService:
             # Friendly guidance for common issues
             hint = ""
             err_lower = (str(e) + "\n".join(stderr_lines)).lower()
-            if "failed to start" in err_lower or "no such file" in err_lower or "not found" in err_lower:
+            if "failed to start" in err_lower or "no such file" in err_lower or "not found" in err_lower or "notimplementederror" in err_lower:
                 if platform.system() == "Windows":
                     hint = (
-                        "\n\n💡 确认 Node.js 已安装且 claude 在 PATH 中。"
-                        f"\n当前 CLI 路径: {resolved_cli}"
+                        f"\n\n💡 Claude Agent SDK 自带 bundled CLI，无需单独安装 Node.js / Claude Code。"
                         f"\n当前工作目录: {resolved_cwd}"
                     )
+                    if resolved_cli:
+                        hint += f"\n⚠️ 配置了显式 cli_path={resolved_cli}，如该路径无效，请在 Provider 设置中清空。"
+                    if "notimplementederror" in err_lower:
+                        hint += (
+                            "\n\n🔧 Windows subprocess 错误 — 确认 main.py 中已设置："
+                            "\n   asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())"
+                        )
                 else:
                     hint = (
-                        f"\n\n💡 CLI 路径: {resolved_cli} 工作目录: {resolved_cwd}"
-                        "\n确认 Claude Code CLI 已安装：npm install -g @anthropic-ai/claude-code"
+                        f"\n\n💡 SDK 自带 bundled CLI，通常无需手动安装。"
+                        f"\n如果仍失败，可手动安装：npm install -g @anthropic-ai/claude-code"
+                        f"\n工作目录: {resolved_cwd}"
                     )
             yield f"⚠️ Claude Agent SDK 错误: {err_detail}{hint}"
 

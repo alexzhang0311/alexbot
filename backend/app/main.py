@@ -27,7 +27,6 @@ async def _seed_default_provider():
     import shutil
     import os as _os
     from app.models import LLMProvider
-    from app.services.llm_service import LLMService
 
     async with async_session() as session:
         result = await session.execute(
@@ -37,39 +36,40 @@ async def _seed_default_provider():
         if count > 0:
             return  # already has providers
 
-        # Auto-detect Claude CLI availability
-        claude_path = LLMService._resolve_claude_cli("/usr/local/bin/claude")
-        has_claude_cli = shutil.which(claude_path) is not None or _os.path.isfile(claude_path)
+        # Check if claude CLI is available anywhere (bundled or system PATH).
+        # SDK auto-detects at runtime, so we only need a rough check for seeding.
+        has_claude = shutil.which("claude") is not None
 
-        if has_claude_cli:
-            provider = LLMProvider(
-                id=str(uuid.uuid4()),
-                name="Claude Agent (默认)",
-                provider_type="claude_agent",
-                base_url="https://api.minimax.chat/anthropic",
-                api_key=settings.OPENAI_API_KEY or "",
-                is_default=True,
-                models={"default": "MiniMax-M2.7"},
-                config={
-                    "timeout": 120,
-                    "cli_path": claude_path,
-                    "cwd": str(_os.getcwd()),
-                    "tools_enabled": True,
-                },
-            )
+        if has_claude:
+            # Explicit path found — store it so SDK doesn't need to search
+            claude_path = shutil.which("claude")
+            config = {
+                "timeout": 120,
+                "cli_path": claude_path,
+                "cwd": str(_os.getcwd()),
+                "tools_enabled": True,
+            }
             logger.info(f"Seeded default: Claude Agent (cli={claude_path})")
         else:
-            provider = LLMProvider(
-                id=str(uuid.uuid4()),
-                name="MiniMax (默认)",
-                provider_type="openai",  # fallback: works everywhere
-                base_url="https://api.minimax.chat/v1",
-                api_key=settings.OPENAI_API_KEY or "",
-                is_default=True,
-                models={"default": "MiniMax-M2.7"},
-                config={"timeout": 120},
-            )
-            logger.info("Seeded default: MiniMax (OpenAI-compatible) — install Claude CLI for Claude Agent")
+            # No system claude found — seed claude_agent anyway.
+            # SDK will use its bundled CLI at runtime (no separate install needed).
+            config = {
+                "timeout": 120,
+                "cwd": str(_os.getcwd()),
+                "tools_enabled": True,
+            }
+            logger.info("Seeded default: Claude Agent (SDK auto-detect bundled CLI)")
+
+        provider = LLMProvider(
+            id=str(uuid.uuid4()),
+            name="Claude Agent (默认)",
+            provider_type="claude_agent",
+            base_url="https://api.minimax.chat/anthropic",
+            api_key=settings.OPENAI_API_KEY or "",
+            is_default=True,
+            models={"default": "MiniMax-M2.7"},
+            config=config,
+        )
 
         session.add(provider)
         await session.commit()
