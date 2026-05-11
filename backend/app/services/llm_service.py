@@ -3,133 +3,9 @@ import httpx
 from sqlalchemy import select, update, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 import uuid
-import anyio
-import anyio._backends._asyncio
 
 from app.models import LLMProvider, User
 from app.core.config import get_settings
-
-
-def _patch_anyio_open_process():
-    """Monkey-patch anyio.open_process to use subprocess.Popen + thread pool.
-
-    Python 3.13 on Windows: _WindowsSelectorEventLoop._make_subprocess_transport
-    is broken (BaseEventLoop NotImplementedError). This bypasses asyncio
-    subprocess entirely, using real pipes via subprocess.Popen in a thread.
-    """
-    import anyio
-    import anyio._backends._asyncio
-    import subprocess as _subprocess
-    import asyncio as _asyncio
-    from loguru import logger as _log
-
-    _original = anyio._backends._asyncio.AsyncIOBackend.open_process
-
-    @classmethod
-    async def _patched_open_process(
-        cls,
-        command,
-        *,
-        shell: bool = False,
-        stdin=None,
-        stdout=None,
-        stderr=None,
-        cwd=None,
-        env=None,
-        bufsize: int = 0,
-    ):
-        loop = _asyncio.get_running_loop()
-
-        def _resolve(setting):
-            if setting is anyio.subprocess.PIPE:
-                return _subprocess.PIPE
-            if setting is anyio.subprocess.DEVNULL:
-                return _subprocess.DEVNULL
-            return setting
-
-        _log.debug(f"[anyio_patch] spawning: {command}")
-
-        proc = await loop.run_in_executor(
-            None,
-            lambda: _subprocess.Popen(
-                command,
-                shell=shell,
-                stdin=_resolve(stdin),
-                stdout=_resolve(stdout),
-                stderr=_resolve(stderr),
-                cwd=cwd,
-                env=env,
-                bufsize=bufsize,
-            ),
-        )
-
-        # ── Async pipe wrappers ────────────────────────────────────
-        class _SendStream:
-            """ByteSendStream: wraps a writable pipe."""
-            def __init__(self, pipe):
-                self._pipe = pipe
-
-            async def send(self, item: bytes):
-                await loop.run_in_executor(None, self._pipe.write, item)
-                await loop.run_in_executor(None, self._pipe.flush)
-
-            async def aclose(self):
-                await loop.run_in_executor(None, self._pipe.close)
-
-        class _ReceiveStream:
-            """ByteReceiveStream: wraps a readable pipe."""
-            def __init__(self, pipe):
-                self._pipe = pipe
-
-            async def receive(self, max_bytes: int = 65536) -> bytes:
-                return await loop.run_in_executor(
-                    None, self._pipe.read, max_bytes
-                )
-
-            async def aclose(self):
-                await loop.run_in_executor(None, self._pipe.close)
-
-        class _PatchedProcess:
-            def __init__(self, proc):
-                self._proc = proc
-                self.pid = proc.pid
-                self.stdin = _SendStream(proc.stdin) if proc.stdin else None
-                self.stdout = (
-                    _ReceiveStream(proc.stdout) if proc.stdout else None
-                )
-                self.stderr = (
-                    _ReceiveStream(proc.stderr) if proc.stderr else None
-                )
-
-            @property
-            def returncode(self):
-                return self._proc.returncode
-
-            async def wait(self) -> int:
-                return await loop.run_in_executor(None, self._proc.wait)
-
-            def terminate(self):
-                self._proc.terminate()
-
-            def kill(self):
-                self._proc.kill()
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *args):
-                if self.stdin:
-                    await self.stdin.aclose()
-                if self.stdout:
-                    await self.stdout.aclose()
-                if self.stderr:
-                    await self.stderr.aclose()
-                await self.wait()
-
-        return _PatchedProcess(proc)
-
-    anyio._backends._asyncio.AsyncIOBackend.open_process = _patched_open_process
-    _log.info("[anyio_patch] installed")
 
 
 class LLMService:
@@ -352,78 +228,163 @@ class LLMService:
         _log.info(f"Claude Agent: env ANTHROPIC_BASE_URL={env.get('ANTHROPIC_BASE_URL','N/A')}")
         _log.info(f"Claude Agent: env ANTHROPIC_API_KEY={'***' if env.get('ANTHROPIC_API_KEY') else 'NOT SET'}")
 
-        # Python 3.13 on Windows: _WindowsSelectorEventLoop._make_subprocess_transport
-        # is broken (delegates to BaseEventLoop → NotImplementedError).
-        # Bypass asyncio.create_subprocess_exec entirely by monkey-patching
-        # anyio's open_process to use subprocess.Popen in a thread pool.
-        if platform.system() == "Windows" and not getattr(
-            anyio._backends._asyncio.AsyncIOBackend, "_open_process_patched", False
-        ):
-            _log.info("Claude Agent: patching anyio.open_process for Windows")
-            _patch_anyio_open_process()
-            anyio._backends._asyncio.AsyncIOBackend._open_process_patched = True
+        if platform.system() == "Windows":
+            # Python 3.13 on Windows: _WindowsSelectorEventLoop subprocess is
+            # broken. Run SDK's query() in a dedicated thread with asyncio.run(),
+            # matching the demo script pattern (fresh event loop, no uvicorn).
+            import threading
+            import queue as _q
+            import asyncio as _aio
 
-        try:
-            _log.info("Claude Agent: calling query()...")
-            async for msg in query(prompt=user_prompt, options=options):
+            _log.info("Claude Agent: running in thread (Windows)")
+            msg_queue: _q.Queue = _q.Queue()
+
+            def _run_sdk() -> None:
+                async def _inner() -> None:
+                    try:
+                        async for msg in query(
+                            prompt=user_prompt, options=options
+                        ):
+                            msg_queue.put(("msg", msg))
+                        msg_queue.put(("done", None))
+                    except Exception as exc:
+                        msg_queue.put(("error", exc))
+
+                _aio.run(_inner())
+
+            thread = threading.Thread(target=_run_sdk, daemon=True)
+            thread.start()
+
+            while True:
+                try:
+                    kind, payload = msg_queue.get(timeout=0.2)
+                except _q.Empty:
+                    await _aio.sleep(0.05)
+                    continue
+
+                if kind == "done":
+                    _log.info("Claude Agent: query() completed (thread)")
+                    return
+                if kind == "error":
+                    import traceback
+
+                    e = payload
+                    cause = e
+                    cause_chain = []
+                    while cause is not None:
+                        cause_chain.append(
+                            f"{type(cause).__name__}: {cause}"
+                        )
+                        cause = cause.__cause__
+                        if len(cause_chain) > 5:
+                            break
+                    _log.error(f"Claude Agent SDK failed: {e}")
+                    _log.error(
+                        f"Cause chain: {' ← '.join(cause_chain)}"
+                    )
+                    err_detail = str(e)
+                    if stderr_lines:
+                        err_detail += (
+                            "\n\nSTDERR:\n"
+                            + "\n".join(stderr_lines[-20:])
+                        )
+                    tb = traceback.format_exc()
+                    err_detail += f"\n\nTRACEBACK:\n{tb}"
+                    hint = (
+                        f"\n\n💡 Claude Agent SDK 自带 bundled CLI，"
+                        f"无需单独安装 Node.js / Claude Code。"
+                        f"\n当前工作目录: {resolved_cwd}"
+                    )
+                    yield f"⚠️ Claude Agent SDK 错误: {err_detail}{hint}"
+                    return
+
+                # kind == "msg"
+                msg = payload
                 if hasattr(msg, "content"):
                     for block in msg.content:
                         if hasattr(block, "text"):
                             yield block.text
-                        elif hasattr(block, "type"):
-                            # Stream tool_use blocks as visible indicators
-                            if block.type == "tool_use":
-                                tool_name = getattr(block, "name", "unknown")
+                        elif (
+                            hasattr(block, "type")
+                            and block.type == "tool_use"
+                        ):
+                            tool_name = getattr(
+                                block, "name", "unknown"
+                            )
+                            if tool_collector is not None:
+                                tool_collector.append(tool_name)
+                            yield (
+                                f"\n🔧 正在使用工具: {tool_name}..."
+                            )
+        else:
+            # Normal path (Linux, macOS, etc.)
+            try:
+                _log.info("Claude Agent: calling query()...")
+                async for msg in query(
+                    prompt=user_prompt, options=options
+                ):
+                    if hasattr(msg, "content"):
+                        for block in msg.content:
+                            if hasattr(block, "text"):
+                                yield block.text
+                            elif (
+                                hasattr(block, "type")
+                                and block.type == "tool_use"
+                            ):
+                                tool_name = getattr(
+                                    block, "name", "unknown"
+                                )
                                 if tool_collector is not None:
                                     tool_collector.append(tool_name)
-                                yield f"\n🔧 正在使用工具: {tool_name}..."
-            _log.info("Claude Agent: query() completed")
-        except Exception as e:
-            import traceback
+                                yield (
+                                    f"\n🔧 正在使用工具: {tool_name}..."
+                                )
+                _log.info("Claude Agent: query() completed")
+            except Exception as e:
+                import traceback
 
-            # Unwrap cause chain for detailed diagnostics
-            cause = e
-            cause_chain = []
-            while cause is not None:
-                cause_chain.append(f"{type(cause).__name__}: {cause}")
-                cause = cause.__cause__
-                if len(cause_chain) > 5:
-                    break
-
-            _log.error(f"Claude Agent SDK failed: {e}")
-            _log.error(f"Cause chain: {' ← '.join(cause_chain)}")
-
-            err_detail = str(e)
-            if stderr_lines:
-                err_detail += "\n\nSTDERR:\n" + "\n".join(stderr_lines[-20:])
-
-            # Include full traceback for debugging
-            tb = traceback.format_exc()
-            err_detail += f"\n\nTRACEBACK:\n{tb}"
-
-            # Friendly guidance for common issues
-            hint = ""
-            err_lower = (str(e) + "\n" + "\n".join(cause_chain) + "\n" + "\n".join(stderr_lines)).lower()
-            if "failed to start" in err_lower or "no such file" in err_lower or "not found" in err_lower or "notimplementederror" in err_lower:
-                if platform.system() == "Windows":
-                    hint = (
-                        f"\n\n💡 Claude Agent SDK 自带 bundled CLI，无需单独安装 Node.js / Claude Code。"
-                        f"\n当前工作目录: {resolved_cwd}"
+                cause = e
+                cause_chain = []
+                while cause is not None:
+                    cause_chain.append(
+                        f"{type(cause).__name__}: {cause}"
                     )
-                    if resolved_cli:
-                        hint += f"\n⚠️ 配置了显式 cli_path={resolved_cli}，如该路径无效，请在 Provider 设置中清空。"
-                    if "notimplementederror" in err_lower:
-                        hint += (
-                            "\n\n🔧 Windows subprocess 错误 — 确认 main.py 中已设置："
-                            "\n   asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())"
-                        )
-                else:
+                    cause = cause.__cause__
+                    if len(cause_chain) > 5:
+                        break
+                _log.error(f"Claude Agent SDK failed: {e}")
+                _log.error(
+                    f"Cause chain: {' ← '.join(cause_chain)}"
+                )
+                err_detail = str(e)
+                if stderr_lines:
+                    err_detail += (
+                        "\n\nSTDERR:\n"
+                        + "\n".join(stderr_lines[-20:])
+                    )
+                tb = traceback.format_exc()
+                err_detail += f"\n\nTRACEBACK:\n{tb}"
+                hint = ""
+                err_lower = (
+                    str(e)
+                    + "\n"
+                    + "\n".join(cause_chain)
+                    + "\n"
+                    + "\n".join(stderr_lines)
+                ).lower()
+                if (
+                    "failed to start" in err_lower
+                    or "no such file" in err_lower
+                    or "not found" in err_lower
+                    or "notimplementederror" in err_lower
+                ):
                     hint = (
                         f"\n\n💡 SDK 自带 bundled CLI，通常无需手动安装。"
-                        f"\n如果仍失败，可手动安装：npm install -g @anthropic-ai/claude-code"
+                        f"\n如果仍失败，可手动安装："
+                        f"npm install -g @anthropic-ai/claude-code"
                         f"\n工作目录: {resolved_cwd}"
                     )
-            yield f"⚠️ Claude Agent SDK 错误: {err_detail}{hint}"
+                yield f"⚠️ Claude Agent SDK 错误: {err_detail}{hint}"
 
     def _build_agent_prompt(self, conversation: List[Dict[str, str]]) -> str:
         """Build a prompt from conversation history for the agent SDK."""
