@@ -228,6 +228,19 @@ class LLMService:
         _log.info(f"Claude Agent: env ANTHROPIC_BASE_URL={env.get('ANTHROPIC_BASE_URL','N/A')}")
         _log.info(f"Claude Agent: env ANTHROPIC_API_KEY={'***' if env.get('ANTHROPIC_API_KEY') else 'NOT SET'}")
 
+        # Python 3.13 on Windows: _WindowsSelectorEventLoop delegates
+        # _make_subprocess_transport to BaseEventLoop → NotImplementedError.
+        # Patch it to use BaseProactorEventLoop's implementation instead.
+        if platform.system() == "Windows":
+            import asyncio as _aio
+            _loop = _aio.get_running_loop()
+            _log.info(f"Claude Agent: running loop = {type(_loop).__name__}")
+            if not hasattr(_loop, '_make_subprocess_transport_patched'):
+                from asyncio import proactor_events as _pe
+                _loop._make_subprocess_transport = _pe.BaseProactorEventLoop._make_subprocess_transport.__get__(_loop)
+                _loop._make_subprocess_transport_patched = True
+                _log.info("Claude Agent: patched _make_subprocess_transport")
+
         try:
             _log.info("Claude Agent: calling query()...")
             async for msg in query(prompt=user_prompt, options=options):
