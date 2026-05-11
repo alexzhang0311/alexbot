@@ -5,13 +5,10 @@ FROM python:3.11-slim
 WORKDIR /app
 
 # Install system dependencies
-# ca-certificates: needed for HTTPS (MiniMax API)
-# lib64 symlink: bundled claude binary expects /lib64/ld-linux-x86-64.so.2 (RHEL path)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
     curl \
-    && rm -rf /var/lib/apt/lists/* \
-    && ln -sf /lib/x86_64-linux-gnu /lib64
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies
 COPY requirements.txt .
@@ -24,12 +21,12 @@ COPY . .
 #   site-packages/claude_agent_sdk/_bundled/claude (ELF binary)
 # No separate Claude Code install needed.
 
+# Create necessary directories BEFORE chown
+RUN mkdir -p /app/logs /app/uploads
+
 # Create non-root user for Claude Agent SDK (CLI refuses to run as root)
 RUN useradd -m -s /bin/bash appuser && \
     chown -R appuser:appuser /app
-
-# Create necessary directories
-RUN mkdir -p /app/logs /app/uploads
 
 USER appuser
 
