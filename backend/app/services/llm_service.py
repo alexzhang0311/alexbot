@@ -229,8 +229,8 @@ class LLMService:
         _log.info(f"Claude Agent: env ANTHROPIC_API_KEY={'***' if env.get('ANTHROPIC_API_KEY') else 'NOT SET'}")
 
         if platform.system() == "Windows":
-            # Python 3.13 on Windows: _WindowsSelectorEventLoop subprocess is
-            # broken. Run SDK's query() in a dedicated thread with asyncio.run(),
+            # Windows: ensure Proactor loop policy for subprocess support.
+            # Run SDK's query() in a dedicated thread with asyncio.run(),
             # matching the demo script pattern (fresh event loop, no uvicorn).
             import threading
             import queue as _q
@@ -240,6 +240,8 @@ class LLMService:
             msg_queue: _q.Queue = _q.Queue()
 
             def _run_sdk() -> None:
+                _aio.set_event_loop_policy(_aio.WindowsProactorEventLoopPolicy())
+
                 async def _inner() -> None:
                     try:
                         async for msg in query(
