@@ -3,6 +3,7 @@ import os
 import re
 from datetime import datetime, timezone
 from typing import Optional, List, AsyncGenerator
+from loguru import logger
 from sqlalchemy import select, func, update, delete, and_
 from sqlalchemy.orm import joinedload
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -169,6 +170,12 @@ class ChatService:
         if not session:
             raise ValueError("Session not found")
 
+        request_id = str(uuid.uuid4())[:8]
+        logger.info(
+            f"[CHAT][{request_id}] start user_id={self.user.id} session_id={request.session_id} "
+            f"request_model={request.model} provider_id={request.provider_id}"
+        )
+
         # Resolve provider: request > session > default
         provider_id = request.provider_id or session.provider_id
         provider_type = await self._get_provider_type(provider_id)
@@ -204,13 +211,15 @@ class ChatService:
         metadata = {"skill_calls": []}
 
         if provider_type == "claude_agent" and tools_enabled:
+            logger.info(f"[CHAT][{request_id}] route=claude_agent tools_enabled={tools_enabled}")
             # Claude Agent SDK mode: model decides tool usage autonomously
             async for chunk in self._call_llm(
                 actual_model,
                 messages,
                 provider_id=provider_id,
                 tools_enabled=True,
-                _tool_collector=_tool_collector
+                _tool_collector=_tool_collector,
+                request_id=request_id,
             ):
                 full_response += chunk
                 yield chunk
@@ -220,6 +229,7 @@ class ChatService:
                 metadata["tool_calls"] = _tool_collector
                 metadata["skill_calls"] = [t for t in _tool_collector if t.startswith("skill-") or t in ("weather","calculator","reminder","qa")]
         else:
+            logger.info(f"[CHAT][{request_id}] route=skill_dispatch_or_llm tools_enabled={tools_enabled}")
             # Non-agent mode: check keyword skills first, fallback to LLM
             skill_results = await self.skill_dispatcher.check_and_execute(
                 request.message, 
@@ -241,7 +251,8 @@ class ChatService:
                     actual_model,
                     messages,
                     provider_id=provider_id,
-                    tools_enabled=False
+                    tools_enabled=False,
+                    request_id=request_id,
                 ):
                     full_response += chunk
                     yield chunk
@@ -265,6 +276,10 @@ class ChatService:
 
         # Update memory with conversation summary if significant
         await self.memory_service.update_from_conversation(request.message, full_response)
+        logger.info(
+            f"[CHAT][{request_id}] completed session_id={request.session_id} "
+            f"response_chars={len(full_response)} tool_calls={len(metadata.get('tool_calls', []))}"
+        )
 
     async def _build_system_prompt(self, provider_type: str = "") -> str:
         """Build system prompt incorporating user memories and preferences"""

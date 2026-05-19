@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import List, AsyncGenerator
+from loguru import logger
 from app.core.database import get_db
 from app.models import User, ChatSession, Message
 from app.schemas import (
@@ -106,10 +107,19 @@ async def chat(
     For streaming, use WebSocket /api/chat/websocket
     """
     chat_svc = ChatService(db, user)
-    
+    logger.info(
+        f"[CHAT-API] /chat user_id={user.id} session_id={request.session_id} provider_id={request.provider_id}"
+    )
+
     full_response = ""
-    async for chunk in chat_svc.chat(request):
-        full_response += chunk
+    try:
+        async for chunk in chat_svc.chat(request):
+            full_response += chunk
+    except Exception:
+        logger.exception(
+            f"[CHAT-API] /chat failed user_id={user.id} session_id={request.session_id}"
+        )
+        raise
     
     # Get the saved message
     messages = await chat_svc.get_session_messages(request.session_id, limit=1)
@@ -124,6 +134,9 @@ async def chat_stream(
 ):
     """Streaming chat via Server-Sent Events (SSE)."""
     chat_svc = ChatService(db, user)
+    logger.info(
+        f"[CHAT-API] /stream user_id={user.id} session_id={request.session_id} provider_id={request.provider_id}"
+    )
     
     async def generate() -> AsyncGenerator[str, None]:
         tool_calls = []
@@ -143,6 +156,9 @@ async def chat_stream(
         except asyncio.CancelledError:
             await db.rollback()
         except Exception as e:
+            logger.exception(
+                f"[CHAT-API] /stream failed user_id={user.id} session_id={request.session_id}"
+            )
             await db.rollback()
             yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
     

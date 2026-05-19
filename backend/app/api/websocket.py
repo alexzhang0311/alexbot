@@ -3,6 +3,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from typing import Optional
 import json
 import asyncio
+from loguru import logger
 from app.core.database import get_db, async_session
 from app.models import User
 from app.schemas import ChatRequest
@@ -44,6 +45,8 @@ async def websocket_chat(websocket: WebSocket, token: str):
     if not user_id:
         await websocket.close(code=4001, reason="Invalid token")
         return
+
+    logger.info(f"[WS] connect user_id={user_id}")
     
     await manager.connect(websocket, user_id)
     
@@ -78,6 +81,7 @@ async def websocket_chat(websocket: WebSocket, token: str):
                 
                 # Send streaming response
                 await websocket.send_json({"type": "start", "session_id": chat_request.session_id})
+                logger.info(f"[WS] message received user_id={user_id} session_id={chat_request.session_id}")
                 
                 full_response = ""
                 async for chunk in chat_svc.chat(chat_request):
@@ -91,9 +95,14 @@ async def websocket_chat(websocket: WebSocket, token: str):
                     "type": "end",
                     "content": full_response,
                 })
+                logger.info(
+                    f"[WS] completed user_id={user_id} session_id={chat_request.session_id} response_chars={len(full_response)}"
+                )
                 
     except WebSocketDisconnect:
+        logger.info(f"[WS] disconnect user_id={user_id}")
         manager.disconnect(user_id)
     except Exception as e:
+        logger.exception(f"[WS] failed user_id={user_id}: {e}")
         await websocket.send_json({"type": "error", "message": str(e)})
         manager.disconnect(user_id)

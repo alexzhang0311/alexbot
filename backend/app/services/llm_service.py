@@ -1,8 +1,10 @@
 from typing import Optional, List, Dict, Any, AsyncGenerator
+import json
 import httpx
 from sqlalchemy import select, update, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 import uuid
+from loguru import logger
 
 from app.models import LLMProvider, User
 from app.core.config import get_settings
@@ -20,6 +22,44 @@ class LLMService:
     def __init__(self, db: AsyncSession):
         self.db = db
         self._cache: Dict[str, LLMProvider] = {}
+
+    @staticmethod
+    def _truncate_text(value: Any, max_len: int = 12000) -> Any:
+        if isinstance(value, str) and len(value) > max_len:
+            return value[:max_len] + f"... <truncated {len(value) - max_len} chars>"
+        return value
+
+    @classmethod
+    def _sanitize_payload(cls, value: Any) -> Any:
+        secret_keys = {
+            "api_key", "apikey", "authorization", "anthropic_api_key", "token", "secret"
+        }
+        if isinstance(value, dict):
+            sanitized = {}
+            for k, v in value.items():
+                if str(k).lower() in secret_keys:
+                    sanitized[k] = "***"
+                else:
+                    sanitized[k] = cls._sanitize_payload(v)
+            return sanitized
+        if isinstance(value, list):
+            return [cls._sanitize_payload(v) for v in value]
+        return cls._truncate_text(value)
+
+    @classmethod
+    def _serialize_sdk_message(cls, msg: Any) -> str:
+        try:
+            if hasattr(msg, "model_dump"):
+                payload = msg.model_dump()
+            elif hasattr(msg, "dict"):
+                payload = msg.dict()
+            elif hasattr(msg, "__dict__"):
+                payload = msg.__dict__
+            else:
+                payload = str(msg)
+            return json.dumps(cls._sanitize_payload(payload), ensure_ascii=False, default=str)
+        except Exception:
+            return str(msg)
 
     async def _get_provider(self, provider_id: str = None, user_id: str = None) -> Optional[LLMProvider]:
         """Get provider by ID, or default provider for user"""
@@ -75,17 +115,27 @@ class LLMService:
         Send chat request to LLM provider.
         Yields response chunks for streaming.
         """
+        request_id = kwargs.get("request_id", str(uuid.uuid4())[:8])
         # provider_id from kwargs takes priority over the parameter
         _pid = kwargs.pop("provider_id", None) or provider_id
         provider = await self._get_provider(_pid, user_id)
         if not provider:
+            logger.warning(f"[LLM][{request_id}] No provider configured for user_id={user_id}")
             yield "⚠️ 未配置 LLM Provider，请先在设置中配置。"
             return
 
         model_name = self._get_model_name(provider, model_type)
         if not model_name:
+            logger.warning(
+                f"[LLM][{request_id}] Provider '{provider.name}' missing model_type='{model_type}'"
+            )
             yield f"⚠️ Provider '{provider.name}' 未配置 '{model_type}' 模型"
             return
+
+        logger.info(
+            f"[LLM][{request_id}] provider={provider.provider_type} provider_id={provider.id} "
+            f"model={model_name} stream={stream} messages={len(messages)}"
+        )
 
         if provider.provider_type == "claude_agent":
             async for chunk in self._call_claude_agent(provider, model_name, messages, stream, **kwargs):
@@ -109,8 +159,6 @@ class LLMService:
         import os as _os
         import platform
 
-        from loguru import logger as _log
-
         # Paths that should never be passed to the SDK — let it auto-detect.
         default_paths = {"/usr/local/bin/claude", "/usr/bin/claude", "claude", None}
 
@@ -119,7 +167,7 @@ class LLMService:
             # don't work via anyio.open_process. Skip them — SDK's bundled
             # claude.exe is the real binary.
             if platform.system() == "Windows" and configured_path.lower().endswith(".cmd"):
-                _log.warning(
+                logger.warning(
                     f"Skipping .CMD wrapper '{configured_path}' — "
                     "SDK will use bundled claude.exe instead"
                 )
@@ -128,7 +176,7 @@ class LLMService:
             if _os.path.isfile(configured_path) or shutil.which(configured_path):
                 return configured_path
 
-            _log.warning(
+            logger.warning(
                 f"Configured cli_path '{configured_path}' not found, "
                 "falling back to SDK auto-detect"
             )
@@ -154,6 +202,8 @@ class LLMService:
         from claude_agent_sdk import query, ClaudeAgentOptions
         import os
         import platform
+
+        request_id = kwargs.get("request_id", str(uuid.uuid4())[:8])
 
         # Split system prompt from conversation messages
         system_prompt = ""
@@ -194,6 +244,7 @@ class LLMService:
         stderr_lines = []
         def _stderr_cb(line: str):
             stderr_lines.append(line)
+            logger.warning(f"[ClaudeSDK][{request_id}][stderr] {line}")
 
         # Build options — only set cli_path when we have a verified path
         options_kwargs: dict = {
@@ -206,14 +257,11 @@ class LLMService:
             "stderr": _stderr_cb,
             "cwd": resolved_cwd,
         }
-        # ── Debug logging ──────────────────────────────────────────
-        from loguru import logger as _log
-
         if resolved_cli:
             options_kwargs["cli_path"] = resolved_cli
-            _log.info(f"Claude Agent: using explicit cli_path={resolved_cli}")
+            logger.info(f"[ClaudeSDK][{request_id}] using explicit cli_path={resolved_cli}")
         else:
-            _log.info("Claude Agent: no cli_path set, SDK will auto-detect (bundled → PATH)")
+            logger.info(f"[ClaudeSDK][{request_id}] no cli_path set, SDK auto-detect (bundled → PATH)")
 
         options = ClaudeAgentOptions(**options_kwargs)
         if system_prompt:
@@ -223,10 +271,34 @@ class LLMService:
         user_prompt = self._build_agent_prompt(conversation)
 
         tool_collector = kwargs.get("_tool_collector", None)
-        _log.info(f"Claude Agent: cwd={resolved_cwd} model={model} cli={'auto-detect' if not resolved_cli else resolved_cli}")
-        _log.info(f"Claude Agent: base_url={provider.base_url} tools={len(allowed_tools)}")
-        _log.info(f"Claude Agent: env ANTHROPIC_BASE_URL={env.get('ANTHROPIC_BASE_URL','N/A')}")
-        _log.info(f"Claude Agent: env ANTHROPIC_API_KEY={'***' if env.get('ANTHROPIC_API_KEY') else 'NOT SET'}")
+        logger.info(
+            f"[ClaudeSDK][{request_id}] start model={model} cwd={resolved_cwd} "
+            f"tools_enabled={tools_enabled} tools={len(allowed_tools)}"
+        )
+
+        raw_request_payload = {
+            "prompt": user_prompt,
+            "options": {
+                "model": options_kwargs.get("model"),
+                "allowed_tools": options_kwargs.get("allowed_tools"),
+                "skills": options_kwargs.get("skills"),
+                "permission_mode": options_kwargs.get("permission_mode"),
+                "include_partial_messages": options_kwargs.get("include_partial_messages"),
+                "cwd": options_kwargs.get("cwd"),
+                "cli_path": options_kwargs.get("cli_path"),
+                "env": {
+                    "ANTHROPIC_BASE_URL": env.get("ANTHROPIC_BASE_URL"),
+                    "ANTHROPIC_API_KEY": env.get("ANTHROPIC_API_KEY"),
+                },
+                "system_prompt": system_prompt,
+            },
+        }
+        logger.info(
+            "[ClaudeSDK][{}] raw request -> {}".format(
+                request_id,
+                json.dumps(self._sanitize_payload(raw_request_payload), ensure_ascii=False, default=str),
+            )
+        )
 
         if platform.system() == "Windows":
             # Windows: ensure Proactor loop policy for subprocess support.
@@ -236,7 +308,7 @@ class LLMService:
             import queue as _q
             import asyncio as _aio
 
-            _log.info("Claude Agent: running in thread (Windows)")
+            logger.info(f"[ClaudeSDK][{request_id}] running in thread (Windows)")
             msg_queue: _q.Queue = _q.Queue()
 
             def _run_sdk() -> None:
@@ -250,7 +322,8 @@ class LLMService:
                             msg_queue.put(("msg", msg))
                         msg_queue.put(("done", None))
                     except Exception as exc:
-                        msg_queue.put(("error", exc))
+                        import traceback
+                        msg_queue.put(("error", (exc, traceback.format_exc())))
 
                 _aio.run(_inner())
 
@@ -265,12 +338,10 @@ class LLMService:
                     continue
 
                 if kind == "done":
-                    _log.info("Claude Agent: query() completed (thread)")
+                    logger.info(f"[ClaudeSDK][{request_id}] query() completed (thread)")
                     return
                 if kind == "error":
-                    import traceback
-
-                    e = payload
+                    e, worker_tb = payload
                     cause = e
                     cause_chain = []
                     while cause is not None:
@@ -280,8 +351,8 @@ class LLMService:
                         cause = cause.__cause__
                         if len(cause_chain) > 5:
                             break
-                    _log.error(f"Claude Agent SDK failed: {e}")
-                    _log.error(
+                    logger.exception(f"[ClaudeSDK][{request_id}] failed: {e}")
+                    logger.error(
                         f"Cause chain: {' ← '.join(cause_chain)}"
                     )
                     err_detail = str(e)
@@ -290,8 +361,7 @@ class LLMService:
                             "\n\nSTDERR:\n"
                             + "\n".join(stderr_lines[-20:])
                         )
-                    tb = traceback.format_exc()
-                    err_detail += f"\n\nTRACEBACK:\n{tb}"
+                    err_detail += f"\n\nTRACEBACK:\n{worker_tb}"
                     hint = (
                         f"\n\n💡 Claude Agent SDK 自带 bundled CLI，"
                         f"无需单独安装 Node.js / Claude Code。"
@@ -302,6 +372,9 @@ class LLMService:
 
                 # kind == "msg"
                 msg = payload
+                logger.info(
+                    f"[ClaudeSDK][{request_id}] raw response <- {self._serialize_sdk_message(msg)}"
+                )
                 if hasattr(msg, "content"):
                     for block in msg.content:
                         if hasattr(block, "text"):
@@ -321,10 +394,13 @@ class LLMService:
         else:
             # Normal path (Linux, macOS, etc.)
             try:
-                _log.info("Claude Agent: calling query()...")
+                logger.info(f"[ClaudeSDK][{request_id}] calling query()")
                 async for msg in query(
                     prompt=user_prompt, options=options
                 ):
+                    logger.info(
+                        f"[ClaudeSDK][{request_id}] raw response <- {self._serialize_sdk_message(msg)}"
+                    )
                     if hasattr(msg, "content"):
                         for block in msg.content:
                             if hasattr(block, "text"):
@@ -341,7 +417,7 @@ class LLMService:
                                 yield (
                                     f"\n🔧 正在使用工具: {tool_name}..."
                                 )
-                _log.info("Claude Agent: query() completed")
+                logger.info(f"[ClaudeSDK][{request_id}] query() completed")
             except Exception as e:
                 import traceback
 
@@ -354,8 +430,8 @@ class LLMService:
                     cause = cause.__cause__
                     if len(cause_chain) > 5:
                         break
-                _log.error(f"Claude Agent SDK failed: {e}")
-                _log.error(
+                logger.exception(f"[ClaudeSDK][{request_id}] failed: {e}")
+                logger.error(
                     f"Cause chain: {' ← '.join(cause_chain)}"
                 )
                 err_detail = str(e)

@@ -22,6 +22,38 @@ from app.api import auth_router, chat_router, ws_router, memory_router, tasks_ro
 settings = get_settings()
 
 
+def _configure_logging() -> None:
+    """Configure log sinks (console + rotating file)."""
+    log_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", settings.LOG_DIR))
+    os.makedirs(log_dir, exist_ok=True)
+
+    logger.remove()
+    logger.add(
+        sys.stderr,
+        level=settings.log_level,
+        enqueue=True,
+        backtrace=True,
+        diagnose=settings.is_dev,
+    )
+    logger.add(
+        os.path.join(log_dir, "app.log"),
+        level=settings.log_level,
+        rotation=settings.LOG_ROTATION,
+        retention=settings.LOG_RETENTION,
+        enqueue=True,
+        backtrace=True,
+        diagnose=settings.is_dev,
+        encoding="utf-8",
+        serialize=settings.LOG_SERIALIZE,
+    )
+    logger.info(
+        f"Logging configured: level={settings.log_level} dir={log_dir} rotation={settings.LOG_ROTATION} retention={settings.LOG_RETENTION}"
+    )
+
+
+_configure_logging()
+
+
 async def _seed_default_provider():
     """Create a default LLM provider if none exist (dev mode only)."""
     import uuid

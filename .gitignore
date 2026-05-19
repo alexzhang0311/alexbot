@@ -16,3 +16,20 @@ node_modules/
 # Claude CLI binary (240MB, too large for git)
 backend/bin/claude.exe
 bin/
+
+# Claude skills
+.claude/skills/**/*
+!.claude/skills/**/
+
+# Demo and logs artifacts
+demo/**/*
+!demo/**/
+backend/demo/**/*
+!backend/demo/**/
+logs/**/*
+!logs/**/
+backend/logs/**/*
+!backend/logs/**/
+
+# Database files
+*.db

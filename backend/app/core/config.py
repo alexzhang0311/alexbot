@@ -24,6 +24,15 @@ class Settings(BaseSettings):
     DEFAULT_MODEL: str = "MiniMax-M2.7"
     OPENAI_API_KEY: str = ""
 
+    # Logging
+    LOG_LEVEL: str = ""
+    LOG_LEVEL_DEV: str = "DEBUG"
+    LOG_LEVEL_PROD: str = "INFO"
+    LOG_DIR: str = "logs"
+    LOG_ROTATION: str = "1 day"
+    LOG_RETENTION: str = "14 days"
+    LOG_SERIALIZE: bool = False
+
     def model_post_init(self, _context):
         """Auto-select database URL based on ENVIRONMENT if not explicitly set."""
         if not self.DATABASE_URL:
@@ -44,6 +53,12 @@ class Settings(BaseSettings):
     @property
     def is_dev(self) -> bool:
         return self.ENVIRONMENT != "production"
+
+    @property
+    def log_level(self) -> str:
+        if self.LOG_LEVEL:
+            return self.LOG_LEVEL.upper()
+        return (self.LOG_LEVEL_DEV if self.is_dev else self.LOG_LEVEL_PROD).upper()
 
     class Config:
         env_file = ".env"

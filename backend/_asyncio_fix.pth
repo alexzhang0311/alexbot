@@ -1,4 +1,0 @@
-import sys; __import__('os').environ.setdefault('_ASYNCIO_FIX_APPLIED', '1')
-if sys.platform == 'win32':
-    import asyncio
-    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
