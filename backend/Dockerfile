@@ -7,6 +7,7 @@ WORKDIR /app
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
+    libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies
@@ -16,16 +17,16 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY . .
 
-# Copy Claude Code CLI binary
-COPY bin/claude.exe /usr/local/bin/claude
-RUN chmod +x /usr/local/bin/claude
+# Claude Agent SDK ships its own bundled Linux CLI at
+#   site-packages/claude_agent_sdk/_bundled/claude (ELF binary)
+# No separate Claude Code install needed.
 
-# Create non-root user for Claude Agent SDK (CLI refuses root + bypassPermissions)
+# Create necessary directories BEFORE chown
+RUN mkdir -p /app/logs /app/uploads
+
+# Create non-root user for Claude Agent SDK (CLI refuses to run as root)
 RUN useradd -m -s /bin/bash appuser && \
     chown -R appuser:appuser /app
-
-# Create necessary directories
-RUN mkdir -p /app/logs /app/uploads
 
 USER appuser
 

@@ -141,9 +141,8 @@ async def lifespan(app: FastAPI):
         async with engine.begin() as conn:
             await _run_migrations(conn)
 
-    # Seed default LLM provider in dev mode
-    if settings.is_dev:
-        await _seed_default_provider()
+    # Seed default LLM provider if none exist (idempotent)
+    await _seed_default_provider()
 
     logger.info("Database tables ready")
     yield
