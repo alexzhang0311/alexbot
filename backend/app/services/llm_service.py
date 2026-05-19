@@ -320,10 +320,73 @@ class LLMService:
                             )
         else:
             # Normal path (Linux, macOS, etc.)
+            # ── Interactive permission approval via can_use_tool ──
+            permission_queue = kwargs.pop("permission_queue", None) or kwargs.pop("_perm_queue", None)
+
+            if permission_queue is not None:
+                from claude_agent_sdk.types import (
+                    HookMatcher, PermissionResultAllow,
+                    PermissionResultDeny, ToolPermissionContext,
+                )
+                import asyncio as _asyncio
+
+                async def can_use_tool(
+                    tool_name: str, input_data: dict, context: ToolPermissionContext
+                ) -> PermissionResultAllow | PermissionResultDeny:
+                    """Handle Claude Code CLI tool permission requests.
+
+                    Pauses SDK stream, sends approval request to frontend via
+                    permission_queue, and waits for user response before continuing.
+                    """
+                    request_id = str(uuid.uuid4())
+                    loop = _asyncio.get_running_loop()
+                    future = loop.create_future()
+
+                    await permission_queue.put({
+                        "type": "permission_request",
+                        "request_id": request_id,
+                        "tool_name": tool_name,
+                        "file_path": input_data.get("file_path", ""),
+                        "content_preview": str(input_data.get("content", ""))[:500],
+                        "command": input_data.get("command", ""),
+                        "description": input_data.get("description", ""),
+                        "_future": future,  # stripped by websocket handler before JSON
+                    })
+
+                    _log.info(f"Claude Agent: waiting for approval (tool={tool_name} id={request_id})")
+                    result = await future
+
+                    if result.get("approved"):
+                        _log.info(f"Claude Agent: approved {tool_name}")
+                        return PermissionResultAllow(updated_input=input_data)
+                    _log.info(f"Claude Agent: denied {tool_name}: {result.get('message','')}")
+                    return PermissionResultDeny(message=result.get("message", "用户拒绝了该操作"))
+
+                async def dummy_hook(input_data, tool_use_id, context):
+                    return {"continue_": True}
+
+                options_kwargs["can_use_tool"] = can_use_tool
+                options_kwargs["hooks"] = {
+                    "PreToolUse": [HookMatcher(matcher=None, hooks=[dummy_hook])]
+                }
+
+                async def prompt_stream():
+                    yield {
+                        "type": "user",
+                        "message": {"role": "user", "content": user_prompt},
+                        "parent_tool_use_id": None,
+                        "session_id": str(uuid.uuid4()),
+                    }
+
+                prompt = prompt_stream()
+                _log.info("Claude Agent: streaming mode with can_use_tool callback")
+            else:
+                prompt = user_prompt
+
             try:
                 _log.info("Claude Agent: calling query()...")
                 async for msg in query(
-                    prompt=user_prompt, options=options
+                    prompt=prompt, options=options
                 ):
                     if hasattr(msg, "content"):
                         for block in msg.content:

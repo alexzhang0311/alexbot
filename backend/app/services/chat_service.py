@@ -159,7 +159,8 @@ class ChatService:
     async def chat(
         self, 
         request: ChatRequest,
-        _tool_collector: list = None
+        _tool_collector: list = None,
+        _perm_queue = None
     ) -> AsyncGenerator[str, None]:
         """
         Main chat loop. Yields response chunks for streaming.
@@ -210,7 +211,8 @@ class ChatService:
                 messages,
                 provider_id=provider_id,
                 tools_enabled=True,
-                _tool_collector=_tool_collector
+                _tool_collector=_tool_collector,
+                _perm_queue=_perm_queue
             ):
                 full_response += chunk
                 yield chunk
