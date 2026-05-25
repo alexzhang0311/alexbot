@@ -160,7 +160,8 @@ class ChatService:
     async def chat(
         self, 
         request: ChatRequest,
-        _tool_collector: list = None
+        _tool_collector: list = None,
+        _user_input_handler=None,
     ) -> AsyncGenerator[str, None]:
         """
         Main chat loop. Yields response chunks for streaming.
@@ -219,6 +220,7 @@ class ChatService:
                 provider_id=provider_id,
                 tools_enabled=True,
                 _tool_collector=_tool_collector,
+                user_input_handler=_user_input_handler,
                 request_id=request_id,
             ):
                 full_response += chunk
@@ -256,29 +258,11 @@ class ChatService:
                 ):
                     full_response += chunk
                     yield chunk
-
-        # Save user message
-        await self.save_message(
-            session_id=request.session_id,
-            role="user",
-            content=request.message,
-            model=actual_model,
-        )
-
-        # Save assistant response
-        await self.save_message(
-            session_id=request.session_id,
-            role="assistant",
-            content=full_response,
-            model=actual_model,
-            metadata_data=metadata,
-        )
-
-        # Update memory with conversation summary if significant
-        await self.memory_service.update_from_conversation(request.message, full_response)
+        
+        # Streaming complete - generator will finish after this
+        # DB save will happen after generator ends (but won't block it)
         logger.info(
-            f"[CHAT][{request_id}] completed session_id={request.session_id} "
-            f"response_chars={len(full_response)} tool_calls={len(metadata.get('tool_calls', []))}"
+            f"[CHAT][{request_id}] streaming complete, scheduling DB save session_id={request.session_id}"
         )
 
     async def _build_system_prompt(self, provider_type: str = "") -> str:

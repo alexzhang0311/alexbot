@@ -45,7 +45,7 @@ class LoginRequest(BaseModel):
 # ── Chat Session ──
 class SessionBase(BaseModel):
     title: Optional[str] = "新对话"
-    model: Optional[str] = "gpt-4o"
+    model: Optional[str] = None
 
 
 class SessionCreate(SessionBase):

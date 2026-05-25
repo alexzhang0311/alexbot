@@ -200,6 +200,7 @@ class LLMService:
     ) -> AsyncGenerator[str, None]:
         """Call Claude Agent SDK with tool support (skills, bash, file ops)"""
         from claude_agent_sdk import query, ClaudeAgentOptions
+        from claude_agent_sdk.types import HookMatcher, PermissionResultAllow, PermissionResultDeny
         import os
         import platform
 
@@ -232,6 +233,49 @@ class LLMService:
         else:
             allowed_tools = []
 
+        user_input_handler = kwargs.get("user_input_handler")
+        if tools_enabled and user_input_handler and "AskUserQuestion" not in allowed_tools:
+            allowed_tools = [*allowed_tools, "AskUserQuestion"]
+
+        async def _dummy_hook(input_data, tool_use_id, context):
+            # Python SDK workaround from docs: keep stream open for can_use_tool
+            return {"continue_": True}
+
+        async def _can_use_tool(tool_name: str, input_data: dict, context):
+            if not user_input_handler:
+                return PermissionResultAllow(updated_input=input_data)
+
+            logger.info(
+                f"[ClaudeSDK][{request_id}] 🔔 触发 can_use_tool 回调 tool={tool_name}"
+            )
+
+            try:
+                decision = await user_input_handler(tool_name, input_data, context)
+            except Exception as e:
+                logger.exception(f"[ClaudeSDK][{request_id}] user_input_handler failed: {e}")
+                return PermissionResultDeny(message=f"用户输入处理失败: {e}")
+
+            if isinstance(decision, dict):
+                behavior = str(decision.get("behavior", "allow")).lower()
+                if behavior == "deny":
+                    logger.warning(
+                        f"[ClaudeSDK][{request_id}] ❌ 用户拒绝工具调用 tool={tool_name} "
+                        f"message={decision.get('message', 'User denied this action')}"
+                    )
+                    return PermissionResultDeny(
+                        message=decision.get("message", "User denied this action")
+                    )
+                logger.info(
+                    f"[ClaudeSDK][{request_id}] ✅ 用户批准工具调用 tool={tool_name}"
+                )
+                return PermissionResultAllow(
+                    updated_input=decision.get("updated_input", input_data)
+                )
+
+            # Default fallback: allow as-is
+            logger.info(f"[ClaudeSDK][{request_id}] ✅ 默认允许 tool={tool_name}")
+            return PermissionResultAllow(updated_input=input_data)
+
         # Resolve CLI path.
         # Only pass cli_path if it's a validated, existing path.
         # When None, SDK auto-detects (bundled CLI → system PATH → common paths).
@@ -257,6 +301,19 @@ class LLMService:
             "stderr": _stderr_cb,
             "cwd": resolved_cwd,
         }
+        if user_input_handler:
+            if str(options_kwargs.get("permission_mode", "")).lower() == "bypasspermissions":
+                # When user interaction is enabled, switch from bypass to interactive mode
+                options_kwargs["permission_mode"] = provider_config.get("interactive_permission_mode", "default")
+            options_kwargs["can_use_tool"] = _can_use_tool
+            options_kwargs["hooks"] = {
+                "PreToolUse": [
+                    HookMatcher(matcher=None, hooks=[_dummy_hook])
+                ]
+            }
+            logger.info(
+                f"[ClaudeSDK][{request_id}] user_input_handler enabled, permission_mode={options_kwargs['permission_mode']}"
+            )
         if resolved_cli:
             options_kwargs["cli_path"] = resolved_cli
             logger.info(f"[ClaudeSDK][{request_id}] using explicit cli_path={resolved_cli}")
@@ -283,6 +340,7 @@ class LLMService:
                 "allowed_tools": options_kwargs.get("allowed_tools"),
                 "skills": options_kwargs.get("skills"),
                 "permission_mode": options_kwargs.get("permission_mode"),
+                "can_use_tool": bool(user_input_handler),
                 "include_partial_messages": options_kwargs.get("include_partial_messages"),
                 "cwd": options_kwargs.get("cwd"),
                 "cli_path": options_kwargs.get("cli_path"),
@@ -299,6 +357,20 @@ class LLMService:
                 json.dumps(self._sanitize_payload(raw_request_payload), ensure_ascii=False, default=str),
             )
         )
+
+        def _build_prompt_input():
+            if user_input_handler:
+                async def _prompt_stream():
+                    yield {
+                        "type": "user",
+                        "message": {
+                            "role": "user",
+                            "content": user_prompt,
+                        },
+                    }
+
+                return _prompt_stream()
+            return user_prompt
 
         if platform.system() == "Windows":
             # Windows: ensure Proactor loop policy for subprocess support.
@@ -317,7 +389,7 @@ class LLMService:
                 async def _inner() -> None:
                     try:
                         async for msg in query(
-                            prompt=user_prompt, options=options
+                            prompt=_build_prompt_input(), options=options
                         ):
                             msg_queue.put(("msg", msg))
                         msg_queue.put(("done", None))
@@ -396,7 +468,7 @@ class LLMService:
             try:
                 logger.info(f"[ClaudeSDK][{request_id}] calling query()")
                 async for msg in query(
-                    prompt=user_prompt, options=options
+                    prompt=_build_prompt_input(), options=options
                 ):
                     logger.info(
                         f"[ClaudeSDK][{request_id}] raw response <- {self._serialize_sdk_message(msg)}"

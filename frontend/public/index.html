@@ -5,9 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>AI Web Tool - 企业内部AI助手</title>
   <script src="https://cdn.tailwindcss.com"></script>
-  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
-  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
-  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js" crossorigin></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; }
     .h-screen { height: 100vh; }
@@ -236,6 +236,116 @@ function MessageBubble({ msg }) {
             ))}
           </div>
         )}
+      </div>
+    </div>
+  );
+}
+
+// ── Approval Dialog ──
+function ApprovalDialog({ data, onApprove, onDeny }) {
+  if (!data) return null;
+  const { tool_name, input } = data;
+  
+  return (
+    <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+      <div className="bg-white rounded-xl p-6 max-w-lg w-full mx-4 shadow-2xl">
+        <h3 className="text-lg font-semibold mb-3 flex items-center gap-2">
+          🔐 工具授权请求
+        </h3>
+        <div className="mb-4 text-sm">
+          <div className="font-medium text-gray-700 mb-2">Claude 想要使用工具: <code className="bg-gray-100 px-2 py-1 rounded text-indigo-600">{tool_name}</code></div>
+          <div className="bg-gray-50 rounded-lg p-3 max-h-48 overflow-y-auto">
+            <pre className="text-xs text-gray-600 whitespace-pre-wrap">{JSON.stringify(input, null, 2)}</pre>
+          </div>
+        </div>
+        <div className="flex gap-3">
+          <button onClick={onApprove} className="flex-1 bg-green-600 text-white py-2 rounded-lg hover:bg-green-700 transition">
+            ✅ 允许
+          </button>
+          <button onClick={onDeny} className="flex-1 bg-red-600 text-white py-2 rounded-lg hover:bg-red-700 transition">
+            ❌ 拒绝
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Question Dialog ──
+function QuestionDialog({ data, onSubmit }) {
+  if (!data) return null;
+  const { input } = data;
+  const questions = input?.questions || [];
+  const [answers, setAnswers] = useState({});
+
+  const handleSubmit = () => {
+    const result = { questions, answers };
+    onSubmit(result);
+  };
+
+  const handleSelectOption = (questionText, optionLabel, isMulti) => {
+    if (isMulti) {
+      const current = answers[questionText] || [];
+      const arr = Array.isArray(current) ? current : [];
+      if (arr.includes(optionLabel)) {
+        setAnswers(prev => ({ ...prev, [questionText]: arr.filter(x => x !== optionLabel) }));
+      } else {
+        setAnswers(prev => ({ ...prev, [questionText]: [...arr, optionLabel] }));
+      }
+    } else {
+      setAnswers(prev => ({ ...prev, [questionText]: optionLabel }));
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+      <div className="bg-white rounded-xl p-6 max-w-2xl w-full mx-4 shadow-2xl max-h-[80vh] overflow-y-auto">
+        <h3 className="text-lg font-semibold mb-3 flex items-center gap-2">
+          ❓ Claude 需要更多信息
+        </h3>
+        <div className="space-y-4 mb-4">
+          {questions.map((q, idx) => (
+            <div key={idx} className="border rounded-lg p-4">
+              <div className="font-medium text-gray-800 mb-2">{q.question}</div>
+              {q.multiSelect && <div className="text-xs text-gray-500 mb-2">（可多选）</div>}
+              <div className="space-y-2">
+                {q.options.map((opt, oidx) => {
+                  const isSelected = q.multiSelect
+                    ? (Array.isArray(answers[q.question]) && answers[q.question].includes(opt.label))
+                    : answers[q.question] === opt.label;
+                  
+                  return (
+                    <div key={oidx}
+                      onClick={() => handleSelectOption(q.question, opt.label, q.multiSelect)}
+                      className={`border rounded-lg p-3 cursor-pointer transition ${
+                        isSelected ? 'bg-indigo-50 border-indigo-500' : 'hover:bg-gray-50'
+                      }`}>
+                      <div className="flex items-start gap-2">
+                        <input type={q.multiSelect ? 'checkbox' : 'radio'}
+                          checked={isSelected}
+                          onChange={() => {}}
+                          className="mt-0.5"
+                        />
+                        <div className="flex-1">
+                          <div className="font-medium text-sm">{opt.label}</div>
+                          {opt.description && <div className="text-xs text-gray-500 mt-1">{opt.description}</div>}
+                          {opt.preview && (
+                            <div className="mt-2 text-xs" dangerouslySetInnerHTML={{__html: opt.preview}} />
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          ))}
+        </div>
+        <button onClick={handleSubmit}
+          disabled={Object.keys(answers).length === 0}
+          className="w-full bg-indigo-600 text-white py-2 rounded-lg hover:bg-indigo-700 disabled:opacity-50 transition">
+          提交回答
+        </button>
       </div>
     </div>
   );
@@ -627,7 +737,10 @@ function App() {
   const [sessionToolsEnabled, setSessionToolsEnabled] = useState(true);
   const [streamingToolCalls, setStreamingToolCalls] = useState([]);
   const [isThinking, setIsThinking] = useState(false);
+  const [pendingApproval, setPendingApproval] = useState(null);
+  const [pendingQuestion, setPendingQuestion] = useState(null);
   const loadUserLock = useRef(false);
+  const wsRef = useRef(null);
 
   useEffect(() => {
     if (token && !loadUserLock.current) loadUser();
@@ -674,9 +787,13 @@ function App() {
 
   const handleNewChat = async () => {
     try {
+      // Use current model or default from active provider
+      const activeProvider = providers.find(p => p.id === (sessionProviderId || llmProvider?.id));
+      const defaultModel = activeProvider?.models?.default || model || undefined;
+      
       const body = {
         title: '新对话',
-        model: model || undefined,
+        model: defaultModel,
         provider_id: sessionProviderId || llmProvider?.id || undefined,
       };
       const s = await api('/chat/sessions', { method: 'POST', body: JSON.stringify(body) });
@@ -732,12 +849,96 @@ function App() {
     await handleUpdateSession({ tools_enabled: enabled });
   };
 
+  const connectWebSocket = useCallback(() => {
+    if (!token) return;
+    
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = `${protocol}//${window.location.host}/api/chat/ws/${token}`;
+    
+    console.log('[WS] Connecting to', wsUrl);
+    const ws = new WebSocket(wsUrl);
+    wsRef.current = ws;
+
+    ws.onopen = () => { console.log('[WS] Connected'); };
+    
+    ws.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        
+        if (data.type === 'start') {
+          setIsThinking(true);
+        } else if (data.type === 'chunk') {
+          setIsThinking(false);
+          setStreamingContent(prev => prev + data.content);
+        } else if (data.type === 'end') {
+          setStreamingToolCalls(data.tool_calls || []);
+          setIsThinking(false);
+          // Reload from server - keep streamingContent until new messages loaded
+          if (currentSession?.id) {
+            api(`/chat/sessions/${currentSession.id}/messages`)
+              .then(msgs => {
+                setMessages(msgs);
+                // Only clear streaming after messages are set and rendered
+                setTimeout(() => {
+                  setStreamingContent('');
+                  setStreamingToolCalls([]);
+                }, 100);
+              })
+              .catch(err => {
+                console.error('[WS] Failed to reload messages:', err);
+                // Keep streaming content visible on error
+              });
+          } else {
+            // No session - shouldn't happen, but clear anyway
+            setTimeout(() => {
+              setStreamingContent('');
+              setStreamingToolCalls([]);
+            }, 100);
+          }
+        } else if (data.type === 'error') {
+          setStreamingContent(prev => prev + '\n⚠️ 错误: ' + data.message);
+          setIsThinking(false);
+        } else if (data.type === 'user_input_required') {
+          // Handle approval or question
+          if (data.kind === 'approval') {
+            setPendingApproval(data);
+          } else if (data.kind === 'question') {
+            setPendingQuestion(data);
+          }
+        } else if (data.type === 'pong') {
+          // Heartbeat response
+        }
+      } catch (err) {
+        console.error('[WS] Parse error:', err);
+      }
+    };
+
+    ws.onerror = (err) => { console.error('[WS] Error:', err); };
+    ws.onclose = () => { console.log('[WS] Closed'); wsRef.current = null; };
+
+    return ws;
+  }, [token, currentSession]);
+
+  useEffect(() => {
+    if (token && !wsRef.current) {
+      connectWebSocket();
+    }
+    return () => {
+      if (wsRef.current) {
+        wsRef.current.close();
+        wsRef.current = null;
+      }
+    };
+  }, [token, connectWebSocket]);
+
   const handleSend = async (content, model) => {
     // Ensure session exists
     let sessionId = currentSession?.id;
     if (!sessionId) {
       try {
-        const s = await api('/chat/sessions', { method: 'POST', body: JSON.stringify({ title: content.slice(0, 20) || '新对话', model: model || undefined, provider_id: sessionProviderId || llmProvider?.id || undefined }) });
+        const activeProvider = providers.find(p => p.id === (sessionProviderId || llmProvider?.id));
+        const defaultModel = activeProvider?.models?.default || model || undefined;
+        const s = await api('/chat/sessions', { method: 'POST', body: JSON.stringify({ title: content.slice(0, 20) || '新对话', model: defaultModel, provider_id: sessionProviderId || llmProvider?.id || undefined }) });
         setSessions(prev => [s, ...prev]);
         setCurrentSession(s);
         sessionId = s.id;
@@ -754,72 +955,72 @@ function App() {
     setStreamingToolCalls([]);
     setIsThinking(true);
 
-    try {
-      const response = await fetch('/api/chat/stream', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-        body: JSON.stringify({
+    // Ensure WebSocket is connected
+    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+      connectWebSocket();
+      // Wait for connection
+      await new Promise(resolve => setTimeout(resolve, 500));
+    }
+
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({
+        type: 'chat',
+        payload: {
           session_id: sessionId,
           message: content,
           model: model || undefined,
           provider_id: sessionProviderId || undefined,
           tools_enabled: sessionToolsEnabled,
-        }),
-      });
-
-      if (!response.ok) {
-        if (response.status === 401) { setToken(null); return; }
-        throw new Error(`HTTP ${response.status}`);
-      }
-
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop(); // keep incomplete line
-
-        for (const line of lines) {
-          if (!line.startsWith('data: ')) continue;
-          try {
-            const data = JSON.parse(line.slice(6));
-            if (data.type === 'text') {
-              setIsThinking(false);
-              setStreamingContent(prev => prev + data.content);
-            } else if (data.type === 'done') {
-              setStreamingToolCalls(data.tool_calls || []);
-            } else if (data.type === 'error') {
-              setStreamingContent(prev => prev + '\n⚠️ 错误: ' + data.message);
-            }
-          } catch (parseErr) {}
-        }
-      }
-
-      // Reload messages from server to get properly saved versions
-      const msgs = await api(`/chat/sessions/${sessionId}/messages`);
-      setMessages(msgs);
-      setStreamingContent('');
-      setStreamingToolCalls([]);
-      setIsThinking(false);
-    } catch (err) {
-      if (err.message === 'SESSION_EXPIRED') { setToken(null); return; }
-      console.error(err);
-      setStreamingContent(prev => prev + '\n⚠️ 连接中断: ' + err.message);
+        },
+      }));
+    } else {
+      setStreamingContent('⚠️ WebSocket 未连接');
       setIsThinking(false);
     }
   };
 
   const handleLogin = (t) => { setToken(t); };
 
+  const handleApprove = () => {
+    if (!wsRef.current || !pendingApproval) return;
+    wsRef.current.send(JSON.stringify({
+      type: 'user_input_response',
+      request_id: pendingApproval.request_id,
+      behavior: 'allow',
+      updated_input: pendingApproval.input,
+    }));
+    setPendingApproval(null);
+  };
+
+  const handleDeny = () => {
+    if (!wsRef.current || !pendingApproval) return;
+    wsRef.current.send(JSON.stringify({
+      type: 'user_input_response',
+      request_id: pendingApproval.request_id,
+      behavior: 'deny',
+      message: '用户拒绝了此操作',
+    }));
+    setPendingApproval(null);
+  };
+
+  const handleQuestionSubmit = (result) => {
+    if (!wsRef.current || !pendingQuestion) return;
+    wsRef.current.send(JSON.stringify({
+      type: 'user_input_response',
+      request_id: pendingQuestion.request_id,
+      behavior: 'allow',
+      updated_input: result,
+    }));
+    setPendingQuestion(null);
+  };
+
   if (!token) return <LoginPage onLogin={handleLogin} />;
 
   return (
-    <div className="flex" style={{height: '100vh'}}>
+    <>
+      <ApprovalDialog data={pendingApproval} onApprove={handleApprove} onDeny={handleDeny} />
+      <QuestionDialog data={pendingQuestion} onSubmit={handleQuestionSubmit} />
+      <div className="flex" style={{height: '100vh'}}>
       <Sidebar sessions={sessions} currentSession={currentSession} onSelectSession={handleSelectSession} onNewChat={handleNewChat} user={user} onOpenSettings={() => { setPreviousView(view); setView('settings'); }} />
       <div className="flex-1 flex flex-col bg-gray-50">
         {view === 'settings' ? (
@@ -885,6 +1086,7 @@ function App() {
         )}
       </div>
     </div>
+    </>
   );
 }
 
