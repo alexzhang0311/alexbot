@@ -33,3 +33,10 @@ backend/logs/**/*
 
 # Database files
 *.db
+*.db-shm
+*.db-wal
+
+# Local debug / generated artifacts
+backend/check_db.py
+backend/greet-yo.skill
+backend/word.txt
