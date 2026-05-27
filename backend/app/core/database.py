@@ -11,6 +11,9 @@ is_sqlite = settings.DATABASE_URL.startswith("sqlite")
 _engine_kwargs = {"echo": settings.ENVIRONMENT == "development"}
 if not is_sqlite:
     _engine_kwargs["pool_pre_ping"] = True
+    _engine_kwargs["pool_size"] = 20
+    _engine_kwargs["max_overflow"] = 10
+    _engine_kwargs["pool_recycle"] = 300
 else:
     # SQLite needs connect_args for check_same_thread
     _engine_kwargs["connect_args"] = {"check_same_thread": False}

@@ -53,116 +53,126 @@ async def websocket_chat(websocket: WebSocket, token: str):
     
     await manager.connect(websocket, user_id)
     
+    # Verify user exists (short-lived session, closed immediately)
+    async with async_session() as db:
+        from sqlalchemy import select
+        from app.models import User
+        result = await db.execute(select(User).where(User.id == user_id))
+        user_check = result.scalar_one_or_none()
+        if not user_check:
+            await websocket.close(code=4004, reason="User not found")
+            return
+    
     try:
-        # Get user from DB
-        async with async_session() as db:
-            from sqlalchemy import select
-            from app.models import User
-            
-            result = await db.execute(select(User).where(User.id == user_id))
-            user = result.scalar_one_or_none()
-            
-            if not user:
-                await websocket.close(code=4004, reason="User not found")
-                return
-            
-            from app.services.chat_service import ChatService
-            chat_svc = ChatService(db, user)
-            main_loop = asyncio.get_running_loop()
-            send_lock = asyncio.Lock()
-            pending_user_inputs: dict[str, concurrent.futures.Future] = {}
-            pending_user_inputs_lock = threading.Lock()
-            active_chat_task: Optional[asyncio.Task] = None
+        main_loop = asyncio.get_running_loop()
+        send_lock = asyncio.Lock()
+        pending_user_inputs: dict[str, concurrent.futures.Future] = {}
+        pending_user_inputs_lock = threading.Lock()
+        active_chat_task: Optional[asyncio.Task] = None
 
-            async def send_json_safe(message: dict):
+        async def send_json_safe(message: dict):
+            try:
                 async with send_lock:
                     await websocket.send_json(message)
+            except RuntimeError:
+                pass  # WebSocket already closed
 
-            async def handle_user_input(tool_name: str, input_data: dict, context) -> dict:
-                """Bridge Claude SDK can_use_tool callback to frontend interaction."""
-                request_id = str(uuid.uuid4())[:8]
-                prompt_kind = "question" if tool_name == "AskUserQuestion" else "approval"
-                response_future: concurrent.futures.Future = concurrent.futures.Future()
+        async def handle_user_input(tool_name: str, input_data: dict, context) -> dict:
+            """Bridge Claude SDK can_use_tool callback to frontend interaction."""
+            request_id = str(uuid.uuid4())[:8]
+            prompt_kind = "question" if tool_name == "AskUserQuestion" else "approval"
+            response_future: concurrent.futures.Future = concurrent.futures.Future()
 
+            logger.info(
+                f"[WS][USER_INPUT] 🔔 Agent 请求用户响应 user_id={user_id} "
+                f"request_id={request_id} kind={prompt_kind} tool={tool_name}"
+            )
+            if prompt_kind == "approval":
+                logger.info(f"[WS][USER_INPUT][APPROVAL] 工具参数: {json.dumps(input_data, ensure_ascii=False)[:500]}")
+            elif prompt_kind == "question" and input_data.get("questions"):
                 logger.info(
-                    f"[WS][USER_INPUT] 🔔 Agent 请求用户响应 user_id={user_id} "
-                    f"request_id={request_id} kind={prompt_kind} tool={tool_name}"
+                    f"[WS][USER_INPUT][QUESTION] 问题数: {len(input_data.get('questions', []))} "
+                    f"首个问题: {input_data['questions'][0].get('question', '')[:100] if input_data.get('questions') else 'N/A'}"
                 )
-                if prompt_kind == "approval":
-                    logger.info(f"[WS][USER_INPUT][APPROVAL] 工具参数: {json.dumps(input_data, ensure_ascii=False)[:500]}")
-                elif prompt_kind == "question" and input_data.get("questions"):
-                    logger.info(
-                        f"[WS][USER_INPUT][QUESTION] 问题数: {len(input_data.get('questions', []))} "
-                        f"首个问题: {input_data['questions'][0].get('question', '')[:100] if input_data.get('questions') else 'N/A'}"
-                    )
 
-                with pending_user_inputs_lock:
-                    pending_user_inputs[request_id] = response_future
+            with pending_user_inputs_lock:
+                pending_user_inputs[request_id] = response_future
 
-                try:
-                    prompt_message = {
-                        "type": "user_input_required",
-                        "request_id": request_id,
-                        "tool_name": tool_name,
-                        "kind": prompt_kind,
-                        "input": input_data,
-                    }
-                    current_loop = asyncio.get_running_loop()
-                    if current_loop is main_loop:
-                        await send_json_safe(prompt_message)
-                    else:
-                        await asyncio.wrap_future(
-                            asyncio.run_coroutine_threadsafe(
-                                send_json_safe(prompt_message),
-                                main_loop,
-                            )
+            try:
+                prompt_message = {
+                    "type": "user_input_required",
+                    "request_id": request_id,
+                    "tool_name": tool_name,
+                    "kind": prompt_kind,
+                    "input": input_data,
+                }
+                current_loop = asyncio.get_running_loop()
+                if current_loop is main_loop:
+                    await send_json_safe(prompt_message)
+                else:
+                    await asyncio.wrap_future(
+                        asyncio.run_coroutine_threadsafe(
+                            send_json_safe(prompt_message),
+                            main_loop,
                         )
-
-                    payload = await asyncio.wrap_future(response_future)
-                finally:
-                    with pending_user_inputs_lock:
-                        pending_user_inputs.pop(request_id, None)
-
-                behavior = str(payload.get("behavior", "")).lower()
-                if not behavior:
-                    if payload.get("allow") is True:
-                        behavior = "allow"
-                    elif payload.get("allow") is False:
-                        behavior = "deny"
-                    else:
-                        behavior = "allow"
-
-                if behavior == "deny":
-                    deny_msg = payload.get("message") or "User denied this action"
-                    logger.info(
-                        f"[WS][USER_INPUT] ❌ 用户拒绝 user_id={user_id} "
-                        f"request_id={request_id} tool={tool_name} reason={deny_msg}"
                     )
-                    return {
-                        "behavior": "deny",
-                        "message": deny_msg,
-                    }
 
-                updated_input = payload.get("updated_input")
-                if updated_input is None:
-                    updated_input = input_data
-                
+                payload = await asyncio.wrap_future(response_future)
+            finally:
+                with pending_user_inputs_lock:
+                    pending_user_inputs.pop(request_id, None)
+
+            behavior = str(payload.get("behavior", "")).lower()
+            if not behavior:
+                if payload.get("allow") is True:
+                    behavior = "allow"
+                elif payload.get("allow") is False:
+                    behavior = "deny"
+                else:
+                    behavior = "allow"
+
+            if behavior == "deny":
+                deny_msg = payload.get("message") or "User denied this action"
                 logger.info(
-                    f"[WS][USER_INPUT] ✅ 用户允许 user_id={user_id} "
-                    f"request_id={request_id} tool={tool_name}"
+                    f"[WS][USER_INPUT] ❌ 用户拒绝 user_id={user_id} "
+                    f"request_id={request_id} tool={tool_name} reason={deny_msg}"
                 )
-                if prompt_kind == "question" and updated_input.get("answers"):
-                    logger.info(
-                        f"[WS][USER_INPUT][ANSWER] 用户回答: {json.dumps(updated_input.get('answers', {}), ensure_ascii=False)[:500]}"
-                    )
-                
                 return {
-                    "behavior": "allow",
-                    "updated_input": updated_input,
+                    "behavior": "deny",
+                    "message": deny_msg,
                 }
 
-            async def process_chat_message(request_data: dict):
-                nonlocal active_chat_task
+            updated_input = payload.get("updated_input")
+            if updated_input is None:
+                updated_input = input_data
+            
+            logger.info(
+                f"[WS][USER_INPUT] ✅ 用户允许 user_id={user_id} "
+                f"request_id={request_id} tool={tool_name}"
+            )
+            if prompt_kind == "question" and updated_input.get("answers"):
+                logger.info(
+                    f"[WS][USER_INPUT][ANSWER] 用户回答: {json.dumps(updated_input.get('answers', {}), ensure_ascii=False)[:500]}"
+                )
+            
+            return {
+                "behavior": "allow",
+                "updated_input": updated_input,
+            }
+
+        async def process_chat_message(request_data: dict):
+            nonlocal active_chat_task
+
+            # ── Each chat message gets its own short-lived DB session ──
+            async with async_session() as chat_db:
+                # Re-fetch user within this session
+                user = (await chat_db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
+                if not user:
+                    await send_json_safe({"type": "error", "message": "User not found"})
+                    return
+
+                from app.services.chat_service import ChatService
+                chat_svc = ChatService(chat_db, user)
 
                 try:
                     if request_data.get("type") == "chat":
@@ -208,7 +218,7 @@ async def websocket_chat(websocket: WebSocket, token: str):
                         model=chat_request.model or "default",
                         metadata_data={"tool_calls": tool_calls} if tool_calls else {},
                     )
-                    await db.commit()
+                    await chat_db.commit()
 
                     await send_json_safe({
                         "type": "end",
@@ -220,63 +230,65 @@ async def websocket_chat(websocket: WebSocket, token: str):
                     )
                 except Exception as e:
                     logger.exception(f"[WS] chat processing failed user_id={user_id}: {e}")
+                    try:
+                        await chat_db.rollback()
+                    except Exception:
+                        pass
                     await send_json_safe({"type": "error", "message": str(e)})
-                finally:
-                    active_chat_task = None
-            
-            # Listen for messages
-            while True:
-                data = await websocket.receive_text()
-                request_data = json.loads(data)
+        
+        # Listen for messages
+        while True:
+            data = await websocket.receive_text()
+            request_data = json.loads(data)
 
-                if request_data.get("type") == "ping":
-                    await send_json_safe({"type": "pong"})
+            if request_data.get("type") == "ping":
+                await send_json_safe({"type": "pong"})
+                continue
+
+            if request_data.get("type") == "user_input_response":
+                request_id = request_data.get("request_id")
+                response_future = None
+                with pending_user_inputs_lock:
+                    response_future = pending_user_inputs.get(request_id)
+
+                if not request_id or response_future is None:
+                    await send_json_safe({
+                        "type": "notice",
+                        "message": "当前没有待确认请求",
+                        "request_id": request_id,
+                    })
                     continue
 
-                if request_data.get("type") == "user_input_response":
-                    request_id = request_data.get("request_id")
-                    response_future = None
-                    with pending_user_inputs_lock:
-                        response_future = pending_user_inputs.get(request_id)
-
-                    if not request_id or response_future is None:
-                        await send_json_safe({
-                            "type": "notice",
-                            "message": "当前没有待确认请求",
-                            "request_id": request_id,
-                        })
-                        continue
-
-                    if response_future.done():
-                        await send_json_safe({
-                            "type": "notice",
-                            "message": "该确认请求已处理",
-                            "request_id": request_id,
-                        })
-                        continue
-
-                    logger.info(
-                        f"[WS][USER_INPUT] 收到前端响应 user_id={user_id} request_id={request_id} "
-                        f"behavior={request_data.get('behavior') or request_data.get('allow')}"
-                    )
-                    response_future.set_result(request_data)
+                if response_future.done():
+                    await send_json_safe({
+                        "type": "notice",
+                        "message": "该确认请求已处理",
+                        "request_id": request_id,
+                    })
                     continue
 
-                if request_data.get("type") == "chat":
-                    if active_chat_task and not active_chat_task.done():
-                        await send_json_safe({
-                            "type": "notice",
-                            "message": "当前已有进行中的请求，请等待完成后再发送新消息",
-                        })
-                        continue
+                logger.info(
+                    f"[WS][USER_INPUT] 收到前端响应 user_id={user_id} request_id={request_id} "
+                    f"behavior={request_data.get('behavior') or request_data.get('allow')}"
+                )
+                response_future.set_result(request_data)
+                continue
 
-                    active_chat_task = asyncio.create_task(process_chat_message(request_data))
+            if request_data.get("type") == "chat":
+                if active_chat_task and not active_chat_task.done():
+                    await send_json_safe({
+                        "type": "notice",
+                        "message": "当前已有进行中的请求，请等待完成后再发送新消息",
+                    })
                     continue
 
-                await send_json_safe({
-                    "type": "error",
-                    "message": f"Unsupported message type: {request_data.get('type')}",
-                })
+                active_chat_task = asyncio.create_task(process_chat_message(request_data))
+                continue
+
+            await send_json_safe({
+                "type": "error",
+                "message": f"Unsupported message type: {request_data.get('type')}",
+            })
                 
     except WebSocketDisconnect:
         logger.info(f"[WS] disconnect user_id={user_id}")
@@ -297,5 +309,8 @@ async def websocket_chat(websocket: WebSocket, token: str):
                 for future in pending_user_inputs.values():
                     if not future.done():
                         future.set_exception(e)
-        await send_json_safe({"type": "error", "message": str(e)})
+        try:
+            await send_json_safe({"type": "error", "message": str(e)})
+        except Exception:
+            pass  # WebSocket may already be closed
         manager.disconnect(user_id)
