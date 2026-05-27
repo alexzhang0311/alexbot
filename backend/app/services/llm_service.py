@@ -1,6 +1,9 @@
 from typing import Optional, List, Dict, Any, AsyncGenerator
 import json
 import httpx
+import os
+import threading
+from contextlib import contextmanager
 from sqlalchemy import select, update, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 import uuid
@@ -8,6 +11,10 @@ from loguru import logger
 
 from app.models import LLMProvider, User
 from app.core.config import get_settings
+from app.services.skill_catalog import get_agent_skill_names
+
+
+_CLAUDE_ENV_LOCK = threading.Lock()
 
 
 class LLMService:
@@ -102,6 +109,31 @@ class LLMService:
         models = provider.models or {}
         return models.get(model_type, models.get("default", ""))
 
+    @staticmethod
+    def _is_third_party_claude_provider(provider: LLMProvider) -> bool:
+        base_url = (provider.base_url or "").rstrip("/").lower()
+        return bool(base_url) and base_url != "https://api.anthropic.com"
+
+    @staticmethod
+    @contextmanager
+    def _temporary_process_env(env_updates: Dict[str, str]):
+        original_values: Dict[str, Optional[str]] = {}
+        with _CLAUDE_ENV_LOCK:
+            try:
+                for key, value in env_updates.items():
+                    original_values[key] = os.environ.get(key)
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+                yield
+            finally:
+                for key, original in original_values.items():
+                    if original is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = original
+
     async def chat(
         self,
         messages: List[Dict[str, str]],
@@ -136,6 +168,20 @@ class LLMService:
             f"[LLM][{request_id}] provider={provider.provider_type} provider_id={provider.id} "
             f"model={model_name} stream={stream} messages={len(messages)}"
         )
+
+        if (
+            provider.provider_type == "claude_agent"
+            and self._is_third_party_claude_provider(provider)
+            and not (provider.api_key or "").strip()
+        ):
+            logger.error(
+                f"[LLM][{request_id}] claude_agent provider '{provider.name}' is missing api_key for third-party base_url={provider.base_url}"
+            )
+            yield (
+                "⚠️ 当前 Claude Agent Provider 未配置第三方渠道 API Key。"
+                "\n请到 LLM Provider 设置里为该 Provider 填写 AUTH TOKEN 后再重试。"
+            )
+            return
 
         if provider.provider_type == "claude_agent":
             async for chunk in self._call_claude_agent(provider, model_name, messages, stream, **kwargs):
@@ -201,7 +247,6 @@ class LLMService:
         """Call Claude Agent SDK with tool support (skills, bash, file ops)"""
         from claude_agent_sdk import query, ClaudeAgentOptions
         from claude_agent_sdk.types import HookMatcher, PermissionResultAllow, PermissionResultDeny
-        import os
         import platform
 
         request_id = kwargs.get("request_id", str(uuid.uuid4())[:8])
@@ -221,6 +266,11 @@ class LLMService:
             env["ANTHROPIC_API_KEY"] = provider.api_key
         if provider.base_url:
             env["ANTHROPIC_BASE_URL"] = provider.base_url.rstrip("/")
+
+        sdk_env = {
+            "ANTHROPIC_API_KEY": env.get("ANTHROPIC_API_KEY"),
+            "ANTHROPIC_BASE_URL": env.get("ANTHROPIC_BASE_URL"),
+        }
 
         # Get tools config from provider config or use defaults
         provider_config = provider.config or {}
@@ -294,7 +344,7 @@ class LLMService:
         options_kwargs: dict = {
             "model": model,
             "allowed_tools": allowed_tools,
-            "skills": ["weather", "calculator", "reminder", "qa"],
+            "skills": get_agent_skill_names(),
             "permission_mode": "bypassPermissions",
             "env": env,
             "include_partial_messages": True,
@@ -388,11 +438,12 @@ class LLMService:
 
                 async def _inner() -> None:
                     try:
-                        async for msg in query(
-                            prompt=_build_prompt_input(), options=options
-                        ):
-                            msg_queue.put(("msg", msg))
-                        msg_queue.put(("done", None))
+                        with self._temporary_process_env(sdk_env):
+                            async for msg in query(
+                                prompt=_build_prompt_input(), options=options
+                            ):
+                                msg_queue.put(("msg", msg))
+                            msg_queue.put(("done", None))
                     except Exception as exc:
                         import traceback
                         msg_queue.put(("error", (exc, traceback.format_exc())))
@@ -467,28 +518,29 @@ class LLMService:
             # Normal path (Linux, macOS, etc.)
             try:
                 logger.info(f"[ClaudeSDK][{request_id}] calling query()")
-                async for msg in query(
-                    prompt=_build_prompt_input(), options=options
-                ):
-                    logger.info(
-                        f"[ClaudeSDK][{request_id}] raw response <- {self._serialize_sdk_message(msg)}"
-                    )
-                    if hasattr(msg, "content"):
-                        for block in msg.content:
-                            if hasattr(block, "text"):
-                                yield block.text
-                            elif (
-                                hasattr(block, "type")
-                                and block.type == "tool_use"
-                            ):
-                                tool_name = getattr(
-                                    block, "name", "unknown"
-                                )
-                                if tool_collector is not None:
-                                    tool_collector.append(tool_name)
-                                yield (
-                                    f"\n🔧 正在使用工具: {tool_name}..."
-                                )
+                with self._temporary_process_env(sdk_env):
+                    async for msg in query(
+                        prompt=_build_prompt_input(), options=options
+                    ):
+                        logger.info(
+                            f"[ClaudeSDK][{request_id}] raw response <- {self._serialize_sdk_message(msg)}"
+                        )
+                        if hasattr(msg, "content"):
+                            for block in msg.content:
+                                if hasattr(block, "text"):
+                                    yield block.text
+                                elif (
+                                    hasattr(block, "type")
+                                    and block.type == "tool_use"
+                                ):
+                                    tool_name = getattr(
+                                        block, "name", "unknown"
+                                    )
+                                    if tool_collector is not None:
+                                        tool_collector.append(tool_name)
+                                    yield (
+                                        f"\n🔧 正在使用工具: {tool_name}..."
+                                    )
                 logger.info(f"[ClaudeSDK][{request_id}] query() completed")
             except Exception as e:
                 import traceback
@@ -740,6 +792,8 @@ class LLMProviderService:
         
         for key in ["name", "base_url", "api_key", "is_default", "models", "config", "is_active"]:
             if key in data:
+                if key == "api_key" and isinstance(data[key], str) and not data[key].strip():
+                    continue
                 setattr(provider, key, data[key])
         
         # If setting as default, unset others

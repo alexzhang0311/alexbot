@@ -741,6 +741,12 @@ function App() {
   const [pendingQuestion, setPendingQuestion] = useState(null);
   const loadUserLock = useRef(false);
   const wsRef = useRef(null);
+  const wsConnectPromiseRef = useRef(null);
+  const currentSessionRef = useRef(null);
+
+  useEffect(() => {
+    currentSessionRef.current = currentSession;
+  }, [currentSession]);
 
   useEffect(() => {
     if (token && !loadUserLock.current) loadUser();
@@ -850,7 +856,15 @@ function App() {
   };
 
   const connectWebSocket = useCallback(() => {
-    if (!token) return;
+    if (!token) return null;
+
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      return Promise.resolve(wsRef.current);
+    }
+
+    if (wsRef.current?.readyState === WebSocket.CONNECTING && wsConnectPromiseRef.current) {
+      return wsConnectPromiseRef.current;
+    }
     
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const wsUrl = `${protocol}//${window.location.host}/api/chat/ws/${token}`;
@@ -859,7 +873,19 @@ function App() {
     const ws = new WebSocket(wsUrl);
     wsRef.current = ws;
 
-    ws.onopen = () => { console.log('[WS] Connected'); };
+    wsConnectPromiseRef.current = new Promise((resolve, reject) => {
+      ws.onopen = () => {
+        console.log('[WS] Connected');
+        wsConnectPromiseRef.current = null;
+        resolve(ws);
+      };
+
+      ws.onerror = (err) => {
+        console.error('[WS] Error:', err);
+        wsConnectPromiseRef.current = null;
+        reject(err);
+      };
+    });
     
     ws.onmessage = (event) => {
       try {
@@ -874,8 +900,8 @@ function App() {
           setStreamingToolCalls(data.tool_calls || []);
           setIsThinking(false);
           // Reload from server - keep streamingContent until new messages loaded
-          if (currentSession?.id) {
-            api(`/chat/sessions/${currentSession.id}/messages`)
+          if (currentSessionRef.current?.id) {
+            api(`/chat/sessions/${currentSessionRef.current.id}/messages`)
               .then(msgs => {
                 setMessages(msgs);
                 // Only clear streaming after messages are set and rendered
@@ -913,11 +939,16 @@ function App() {
       }
     };
 
-    ws.onerror = (err) => { console.error('[WS] Error:', err); };
-    ws.onclose = () => { console.log('[WS] Closed'); wsRef.current = null; };
+    ws.onclose = () => {
+      console.log('[WS] Closed');
+      wsConnectPromiseRef.current = null;
+      if (wsRef.current === ws) {
+        wsRef.current = null;
+      }
+    };
 
-    return ws;
-  }, [token, currentSession]);
+    return wsConnectPromiseRef.current;
+  }, [token]);
 
   useEffect(() => {
     if (token && !wsRef.current) {
@@ -928,6 +959,7 @@ function App() {
         wsRef.current.close();
         wsRef.current = null;
       }
+      wsConnectPromiseRef.current = null;
     };
   }, [token, connectWebSocket]);
 
@@ -956,14 +988,17 @@ function App() {
     setIsThinking(true);
 
     // Ensure WebSocket is connected
-    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
-      connectWebSocket();
-      // Wait for connection
-      await new Promise(resolve => setTimeout(resolve, 500));
+    let ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      try {
+        ws = await connectWebSocket();
+      } catch (e) {
+        console.error('[WS] Failed to connect before sending:', e);
+      }
     }
 
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({
         type: 'chat',
         payload: {
           session_id: sessionId,

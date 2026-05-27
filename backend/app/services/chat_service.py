@@ -1,6 +1,4 @@
 import uuid
-import os
-import re
 from datetime import datetime, timezone
 from typing import Optional, List, AsyncGenerator
 from loguru import logger
@@ -11,6 +9,7 @@ from app.models import ChatSession, Message, User, LLMProvider
 from app.schemas import ChatRequest, MessageResponse, SessionUpdate
 from app.core.config import get_settings
 from app.services.memory_service import MemoryService
+from app.services.skill_catalog import build_skills_prompt
 from app.services.skill_dispatcher import SkillDispatcher
 
 settings = get_settings()
@@ -271,7 +270,7 @@ class ChatService:
         prefs = self.user.preferences or {}
         
         # Dynamically load skills from .claude/skills/ directory
-        skills_prompt = self._load_skills_prompt()
+        skills_prompt = build_skills_prompt()
         
         if provider_type == "claude_agent":
             prompt = (
@@ -302,62 +301,6 @@ class ChatService:
             prompt = f"请使用{prefs['language']}回复。" + prompt
         
         return prompt
-
-    def _load_skills_prompt(self) -> str:
-        """Dynamically load all skill descriptions from .claude/skills/ directory.
-        
-        Reads SKILL.md files at request time, so adding/modifying skills
-        takes effect immediately without restart.
-        """
-        skills_dir = os.path.join(os.path.dirname(__file__), "..", "..", ".claude", "skills")
-        skills_dir = os.path.abspath(skills_dir)
-        
-        if not os.path.isdir(skills_dir):
-            return ""
-        
-        lines = []
-        for entry in sorted(os.listdir(skills_dir)):
-            skill_path = os.path.join(skills_dir, entry, "SKILL.md")
-            if not os.path.isfile(skill_path):
-                continue
-            
-            try:
-                with open(skill_path, "r", encoding="utf-8") as f:
-                    content = f.read()
-                
-                # Parse YAML frontmatter
-                name = entry
-                desc = ""
-                fm_match = re.match(r"^---\s*\n(.*?)\n---", content, re.DOTALL)
-                if fm_match:
-                    for fm_line in fm_match.group(1).split("\n"):
-                        kv = fm_line.split(":", 1)
-                        if len(kv) == 2:
-                            key, val = kv[0].strip(), kv[1].strip()
-                            if key == "name":
-                                name = val
-                            elif key == "description":
-                                desc = val
-                
-                # Build a concise one-liner for the prompt
-                skill_line = f"### /{name} - {desc}" if desc else f"### /{name}"
-                lines.append(skill_line)
-                
-                # Include body summary (first non-empty line after frontmatter)
-                body = re.sub(r"^---\s*\n.*?\n---\s*\n*", "", content, flags=re.DOTALL)
-                body_summary = ""
-                for bl in body.split("\n"):
-                    bl = bl.strip()
-                    if bl and not bl.startswith("#"):
-                        body_summary = bl[:120]
-                        break
-                if body_summary:
-                    lines.append(f"  {body_summary}")
-                
-            except Exception:
-                pass
-        
-        return "\n".join(lines) if lines else ""
 
     async def _call_llm(self, model: str, messages: list, **kwargs) -> AsyncGenerator[str, None]:
         """Call LLM using configured provider (OpenAI compatible or Anthropic)"""
